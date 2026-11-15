@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Oreki0504/Argus-C2/internal/enrollment"
@@ -21,11 +23,26 @@ import (
 )
 
 type Runner struct {
-	Server, CA, Dir string
-	Client          *http.Client
-	Engine          *Engine
-	cert            *x509.Certificate
-	nextRenewal     time.Time
+	Server, CA, Dir       string
+	Client                *http.Client
+	Engine                *Engine
+	cert                  *x509.Certificate
+	nextRenewal           time.Time
+	clientMu              sync.RWMutex
+	renewMu               sync.Mutex
+	telemetryMu           sync.Mutex
+	telemetry             *TelemetryBuffer
+	bootID                string
+	startedAt             time.Time
+	nextTelemetry         time.Time
+	diagnosticMetadata    atomic.Bool
+	capabilitiesSupported atomic.Bool
+	capabilitiesWake      chan struct{}
+	nextCapabilities      time.Time
+	// Internal scheduling overrides allow concurrency tests without changing
+	// the public 30-second minimum collection interval.
+	testTelemetryInterval time.Duration
+	testHeartbeatInterval time.Duration
 }
 
 func Open(server, ca, dir string, p policy.Policy) (*Runner, error) {
@@ -67,11 +84,31 @@ func Open(server, ca, dir string, p policy.Policy) (*Runner, error) {
 		state.Close()
 		return nil, e
 	}
-	return &Runner{Server: server, CA: ca, Dir: dir, Client: client, Engine: &Engine{State: state, Policy: p}, cert: cert}, nil
+	bootID := identity.RandomID()
+	return &Runner{Server: server, CA: ca, Dir: dir, Client: client, Engine: &Engine{State: state, Policy: p, BootID: bootID}, cert: cert, bootID: bootID, startedAt: time.Now()}, nil
 }
-func (r *Runner) Close() error { r.Client.CloseIdleConnections(); return r.Engine.State.Close() }
+func (r *Runner) Close() error {
+	r.clientMu.RLock()
+	if r.Client != nil {
+		r.Client.CloseIdleConnections()
+	}
+	r.clientMu.RUnlock()
+	var telemetryErr error
+	r.telemetryMu.Lock()
+	if r.telemetry != nil {
+		telemetryErr = r.telemetry.Close()
+	}
+	r.telemetryMu.Unlock()
+	return errors.Join(telemetryErr, r.Engine.State.Close())
+}
 func (r *Runner) request(ctx context.Context, path string, v any) ([]byte, error) {
-	return transport.Request(ctx, r.Client, r.Server, "", "POST", path, v)
+	r.clientMu.RLock()
+	client := r.Client
+	r.clientMu.RUnlock()
+	return transport.RequestWithHeaders(ctx, client, r.Server, "", "POST", path, v, func(header http.Header) {
+		r.diagnosticMetadata.Store(len(header.Values(protocol.DiagnosticMetadataHeader)) == 1 && header.Get(protocol.DiagnosticMetadataHeader) == "1")
+		r.capabilitiesSupported.Store(len(header.Values(protocol.CapabilitiesHeader)) == 1 && header.Get(protocol.CapabilitiesHeader) == "1")
+	})
 }
 func (r *Runner) flush(ctx context.Context) error {
 	// Bound one upload batch independently of the number of pending results.
@@ -111,42 +148,89 @@ func (r *Runner) Step(ctx context.Context) error {
 	if e := r.Engine.State.Recover(ctx); e != nil {
 		return e
 	}
-	now := time.Now()
-	if now.Before(r.cert.NotBefore) || !now.Before(r.cert.NotAfter) {
-		return errors.New("agent certificate is not currently valid; reenrollment required")
-	}
-	if time.Until(r.cert.NotAfter) < 7*24*time.Hour && !now.Before(r.nextRenewal) {
-		// A renewal endpoint outage must not consume the whole communication
-		// cycle or suppress uploads/heartbeats using a still-valid certificate.
-		renewCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := r.Renew(renewCtx)
-		cancel()
-		r.nextRenewal = time.Now().Add(min(5*time.Minute, max(time.Second, time.Until(r.cert.NotAfter)/2)))
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if !time.Now().Before(r.cert.NotAfter) {
-				return err
-			}
-			slog.Warn("certificate renewal failed; valid identity remains in use", "error", err, "certificate_expires_at", r.cert.NotAfter.Unix())
-		}
+	if err := r.identityStep(ctx); err != nil {
+		return err
 	}
 	flushErr := r.flush(ctx)
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	if err := r.heartbeat(ctx); err != nil {
+		return err
+	}
+	if err := r.reportCapabilities(ctx); err != nil && ctx.Err() == nil {
+		slog.Warn("capability reporting deferred", "error", err)
+	}
+	// Telemetry has independent error handling. Its storage or delivery failure
+	// does not deny an otherwise valid diagnostic operation.
+	if err := r.collectTelemetry(ctx); err != nil && ctx.Err() == nil {
+		slog.Warn("telemetry collection deferred", "error", err)
+	}
+	if err := r.flushTelemetry(ctx); err != nil && ctx.Err() == nil {
+		slog.Warn("telemetry delivery deferred", "error", err)
+	}
+	if flushErr != nil {
+		return flushErr
+	}
+	return r.diagnostic(ctx, false)
+}
+
+func (r *Runner) identityStep(ctx context.Context) error {
+	r.clientMu.RLock()
+	cert := r.cert
+	r.clientMu.RUnlock()
+	now := time.Now()
+	if cert == nil || now.Before(cert.NotBefore) || !now.Before(cert.NotAfter) {
+		return errors.New("agent certificate is not currently valid; reenrollment required")
+	}
+	if time.Until(cert.NotAfter) < 7*24*time.Hour && !now.Before(r.nextRenewal) {
+		// A renewal endpoint outage must not consume the whole communication
+		// cycle or suppress uploads/heartbeats using a still-valid certificate.
+		renewCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := r.Renew(renewCtx)
+		cancel()
+		r.clientMu.RLock()
+		cert = r.cert
+		r.clientMu.RUnlock()
+		r.nextRenewal = time.Now().Add(min(5*time.Minute, max(time.Second, time.Until(cert.NotAfter)/2)))
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if !time.Now().Before(cert.NotAfter) {
+				return err
+			}
+			slog.Warn("certificate renewal failed; valid identity remains in use", "error", err, "certificate_expires_at", cert.NotAfter.Unix())
+		}
+	}
+	return nil
+}
+
+func (r *Runner) heartbeat(ctx context.Context) error {
 	host, e := os.Hostname()
 	if e != nil {
 		return e
 	}
-	if _, e = r.request(ctx, "/v1/agent/heartbeat", protocol.Heartbeat{Hostname: host}); e != nil {
-		return e
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, e = r.request(ctx, "/v1/agent/heartbeat", protocol.Heartbeat{Hostname: host})
+	if e == nil && r.capabilitiesWake != nil {
+		select {
+		case r.capabilitiesWake <- struct{}{}:
+		default:
+		}
 	}
-	// Heartbeat still runs after an upload failure. Do not accept fresh work
-	// until a transient/identity/protocol error has been resolved.
-	if flushErr != nil {
-		return flushErr
+	return e
+}
+
+func (r *Runner) diagnostic(ctx context.Context, flush bool) error {
+	if flush {
+		if err := r.Engine.State.Recover(ctx); err != nil {
+			return err
+		}
+		if err := r.flush(ctx); err != nil {
+			return err
+		}
 	}
 	b, e := r.request(ctx, "/v1/agent/poll", struct{}{})
 	if e != nil || len(b) == 0 {
@@ -156,6 +240,7 @@ func (r *Runner) Step(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
+	r.Engine.ReportMetadata = r.diagnosticMetadata.Load()
 	result, e := r.Engine.Process(ctx, t, func(ctx context.Context, id string) error {
 		b, e := r.request(ctx, "/v1/agent/tasks/"+id+"/running", struct{}{})
 		if e != nil {
@@ -176,6 +261,8 @@ func (r *Runner) Step(ctx context.Context) error {
 	return r.upload(ctx, result)
 }
 func (r *Runner) Renew(ctx context.Context) error {
+	r.renewMu.Lock()
+	defer r.renewMu.Unlock()
 	key, e := loadKey(filepath.Join(r.Dir, "agent-key.pem"))
 	if e != nil {
 		return e
@@ -206,29 +293,68 @@ func (r *Runner) Renew(ctx context.Context) error {
 	if e != nil {
 		return e
 	}
-	r.Client.CloseIdleConnections()
+	r.clientMu.Lock()
+	previous := r.Client
 	r.Client = client
 	r.cert = cert
+	r.clientMu.Unlock()
+	previous.CloseIdleConnections()
 	return nil
 }
 func (r *Runner) Run(ctx context.Context) error {
-	delay := time.Duration(r.Engine.Policy.PollSeconds) * time.Second
-	for {
-		e := r.Step(ctx)
+	if err := r.Engine.Policy.Validate(); err != nil {
+		return err
+	}
+	var workers sync.WaitGroup
+	r.capabilitiesWake = make(chan struct{}, 1)
+	start := func(f func()) { workers.Add(1); go func() { defer workers.Done(); f() }() }
+	heartbeatInterval := time.Duration(r.Engine.Policy.PollSeconds) * time.Second
+	if r.testHeartbeatInterval > 0 {
+		heartbeatInterval = r.testHeartbeatInterval
+	}
+	start(func() {
+		r.repeat(ctx, "heartbeat", heartbeatInterval, func(ctx context.Context) error {
+			if err := r.identityStep(ctx); err != nil {
+				return err
+			}
+			return r.heartbeat(ctx)
+		})
+	})
+	start(func() {
+		r.repeat(ctx, "diagnostic", time.Duration(r.Engine.Policy.PollSeconds)*time.Second, func(ctx context.Context) error { return r.diagnostic(ctx, true) })
+	})
+	start(func() { r.capabilitiesLoop(ctx) })
+	if r.Engine.Policy.RuntimeTelemetry().Enabled {
+		start(func() { r.collectTelemetryLoop(ctx) })
+		start(func() { r.repeat(ctx, "telemetry delivery", 5*time.Second, r.flushTelemetry) })
+	}
+	<-ctx.Done()
+	workers.Wait()
+	return nil
+}
+
+func (r *Runner) repeat(ctx context.Context, name string, interval time.Duration, operation func(context.Context) error) {
+	delay := interval
+	for ctx.Err() == nil {
+		err := operation(ctx)
 		if ctx.Err() != nil {
-			return nil
+			return
 		}
-		if e != nil {
-			slog.Warn("agent cycle failed; will retry", "error", e)
-			delay = min(60*time.Second, max(5*time.Second, delay*2))
+		if err != nil {
+			slog.Warn(name+" failed; will retry", "error", err)
+			delay = min(60*time.Second, max(interval, delay*2))
 		} else {
-			delay = time.Duration(r.Engine.Policy.PollSeconds) * time.Second
+			delay = interval
 		}
-		timer := time.NewTimer(delay + time.Duration(rand.IntN(1000))*time.Millisecond)
+		jitter := time.Duration(rand.IntN(1000)) * time.Millisecond
+		if interval < time.Second {
+			jitter = 0
+		}
+		timer := time.NewTimer(delay + jitter)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil
+			return
 		case <-timer.C:
 		}
 	}

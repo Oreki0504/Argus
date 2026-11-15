@@ -17,6 +17,9 @@ func EquivalentResults(t Task, a, b Result) (bool, error) {
 	if a.TaskID != b.TaskID || a.NodeID != b.NodeID || a.Status != b.Status || a.Error != b.Error || a.CompletedAt != b.CompletedAt {
 		return false, nil
 	}
+	if !reflect.DeepEqual(a.Collection, b.Collection) {
+		return false, nil
+	}
 	if a.Status != Succeeded {
 		return true, nil // Both payloads were validated as empty objects.
 	}

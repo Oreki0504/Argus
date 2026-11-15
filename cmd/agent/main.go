@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -77,10 +78,32 @@ func run() error {
 			if e != nil {
 				return e
 			}
+			var telemetry *agent.TelemetryBufferStatus
+			var telemetryStorage *localdb.Storage
+			if _, statErr := os.Lstat(filepath.Join(c.StateDir, "telemetry.db")); statErr == nil {
+				buffer, err := agent.OpenTelemetryBuffer(c.StateDir, state.NodeID, p.RuntimeTelemetry().BufferMaxBytes, false)
+				if err != nil {
+					return err
+				}
+				defer buffer.Close()
+				status, err := buffer.Status(ctx)
+				if err != nil {
+					return err
+				}
+				physical, err := localdb.InspectStorage(c.StateDir, "telemetry.db")
+				if err != nil {
+					return err
+				}
+				telemetry, telemetryStorage = &status, &physical
+			} else if !os.IsNotExist(statErr) {
+				return statErr
+			}
 			return json.NewEncoder(os.Stdout).Encode(struct {
-				Storage localdb.Storage      `json:"storage"`
-				Results agent.ResultCapacity `json:"results"`
-			}{storage, capacity})
+				Storage          localdb.Storage              `json:"storage"`
+				Results          agent.ResultCapacity         `json:"results"`
+				Telemetry        *agent.TelemetryBufferStatus `json:"telemetry"`
+				TelemetryStorage *localdb.Storage             `json:"telemetry_storage"`
+			}{storage, capacity, telemetry, telemetryStorage})
 		}
 		return maintain(ctx, state, os.Args[1], *taskID, *after, *out, *confirm, os.Stdin, os.Stdout, os.Stderr)
 	}

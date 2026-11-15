@@ -34,7 +34,7 @@ func (s *Store) CreateTask(ctx context.Context, actor string, r protocol.TaskReq
 	t := protocol.Task{ID: identity.RandomID(), NodeID: r.NodeID, Type: r.Type, Params: r.Params, Status: protocol.Pending, CreatedAt: now, DispatchExpiresAt: now + int64(r.TTLSeconds), ExecutionTimeoutMS: r.ExecutionTimeoutMS, ResultDueAt: now + int64(r.TTLSeconds) + protocol.ResultGraceSeconds}
 	e = s.Write(ctx, func(tx *sql.Tx) error {
 		var status string
-		if e := tx.QueryRowContext(ctx, "SELECT status FROM nodes WHERE id=?", t.NodeID).Scan(&status); e != nil {
+		if e := tx.QueryRowContext(ctx, "SELECT CASE WHEN EXISTS(SELECT 1 FROM node_revocations WHERE node_id=nodes.id) THEN 'revoked' ELSE status END FROM nodes WHERE id=?", t.NodeID).Scan(&status); e != nil {
 			if errors.Is(e, sql.ErrNoRows) {
 				return ErrNotFound
 			}
@@ -213,6 +213,13 @@ func (s *Store) SubmitResult(ctx context.Context, c *x509.Certificate, r protoco
 }
 func insertResult(ctx context.Context, tx *sql.Tx, r protocol.Result, receivedAt int64) error {
 	_, e := tx.ExecContext(ctx, "INSERT INTO results(task_id,node_id,status,payload,error,completed_at,received_at) VALUES(?,?,?,?,?,?,?)", r.TaskID, r.NodeID, r.Status, string(r.Payload), r.Error, r.CompletedAt, receivedAt)
+	if e == nil && r.Collection != nil {
+		var raw []byte
+		if raw, e = json.Marshal(r.Collection); e != nil {
+			return e
+		}
+		_, e = tx.ExecContext(ctx, "INSERT INTO diagnostic_result_metadata(task_id,payload_json) VALUES(?,?)", r.TaskID, string(raw))
+	}
 	return e
 }
 
@@ -235,8 +242,18 @@ func updateOne(ctx context.Context, tx *sql.Tx, query string, args ...any) error
 func resultTx(ctx context.Context, tx *sql.Tx, id string) (protocol.Result, error) {
 	var r protocol.Result
 	var p string
-	e := tx.QueryRowContext(ctx, "SELECT task_id,node_id,status,payload,error,completed_at FROM results WHERE task_id=?", id).Scan(&r.TaskID, &r.NodeID, &r.Status, &p, &r.Error, &r.CompletedAt)
+	var collection sql.NullString
+	e := tx.QueryRowContext(ctx, "SELECT r.task_id,r.node_id,r.status,r.payload,r.error,r.completed_at,m.payload_json FROM results r LEFT JOIN diagnostic_result_metadata m ON m.task_id=r.task_id WHERE r.task_id=?", id).Scan(&r.TaskID, &r.NodeID, &r.Status, &p, &r.Error, &r.CompletedAt, &collection)
 	r.Payload = json.RawMessage(p)
+	if e == nil && collection.Valid {
+		if e = json.Unmarshal([]byte(collection.String), &r.Collection); e != nil {
+			return r, e
+		}
+		if r.Collection == nil {
+			return r, errors.New("invalid persisted diagnostic metadata")
+		}
+		e = r.Collection.Validate(r.CompletedAt)
+	}
 	return r, e
 }
 

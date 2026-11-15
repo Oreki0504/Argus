@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://argus.invalid/schemas/telemetry.json",
+  "title": "Argus telemetry batch version 1",
+  "description": "Strict server validation additionally enforces timestamp windows, resource uniqueness, availability consistency, finite CPU values and a 512 KiB encoded request limit.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "samples"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "samples": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/sample"}}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+    "bytes": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+    "sample": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sample_id", "boot_id", "observed_at", "agent_version", "interval_seconds", "metrics", "system", "agent", "errors"],
+      "properties": {
+        "sample_id": {"$ref": "#/$defs/id"}, "boot_id": {"$ref": "#/$defs/id"},
+        "observed_at": {"type": "integer", "minimum": 1},
+        "agent_version": {"type": "string", "pattern": "^[A-Za-z0-9._+-]{1,128}$"},
+        "interval_seconds": {"type": "integer", "minimum": 30, "maximum": 300},
+        "metrics": {"$ref": "#/$defs/metrics"}, "system": {"$ref": "#/$defs/system"},
+        "agent": {
+          "type": "object", "additionalProperties": false,
+          "required": ["uptime_seconds", "buffered_samples", "dropped_samples"],
+          "properties": {
+            "uptime_seconds": {"type": "integer", "minimum": 0},
+            "buffered_samples": {"type": "integer", "minimum": 0, "maximum": 2000},
+            "dropped_samples": {"$ref": "#/$defs/bytes"}
+          }
+        },
+        "errors": {
+          "type": "array", "maxItems": 32,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["resource_id", "code"],
+            "properties": {
+              "resource_id": {"type": "string", "minLength": 1, "maxLength": 256},
+              "code": {"enum": ["unavailable", "permission_denied", "timeout", "collection_failed", "storage_pressure"]}
+            }
+          }
+        }
+      }
+    },
+    "system": {
+      "type": "object", "additionalProperties": false,
+      "required": ["available", "os", "architecture", "hostname", "kernel", "boot_time"],
+      "properties": {
+        "available": {"type": "boolean"},
+        "os": {"type": "string", "minLength": 1, "maxLength": 32},
+        "architecture": {"type": "string", "minLength": 1, "maxLength": 32},
+        "hostname": {"type": "string", "maxLength": 255},
+        "kernel": {"type": "string", "maxLength": 255},
+        "boot_time": {"type": "integer", "minimum": 0}
+      }
+    },
+    "metrics": {
+      "type": "object", "additionalProperties": false, "required": ["cpu", "memory", "disks", "networks"],
+      "properties": {
+        "cpu": {
+          "type": "object", "additionalProperties": false, "required": ["available", "busy_percent", "window_ms"],
+          "properties": {
+            "available": {"type": "boolean"}, "busy_percent": {"type": "number", "minimum": 0, "maximum": 100},
+            "window_ms": {"type": "integer", "minimum": 0, "maximum": 10000}
+          }
+        },
+        "memory": {
+          "type": "object", "additionalProperties": false, "required": ["available", "total_bytes", "available_bytes"],
+          "properties": {"available": {"type": "boolean"}, "total_bytes": {"$ref": "#/$defs/bytes"}, "available_bytes": {"$ref": "#/$defs/bytes"}}
+        },
+        "disks": {
+          "type": "array", "maxItems": 8,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["path", "available", "total_bytes", "available_bytes"],
+            "properties": {"path": {"type": "string", "pattern": "^/", "maxLength": 256}, "available": {"type": "boolean"}, "total_bytes": {"$ref": "#/$defs/bytes"}, "available_bytes": {"$ref": "#/$defs/bytes"}}
+          }
+        },
+        "networks": {
+          "type": "array", "maxItems": 16,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["interface", "available", "rx_bytes", "tx_bytes"],
+            "properties": {"interface": {"type": "string", "minLength": 1, "maxLength": 15, "pattern": "^[^/: ]+$"}, "available": {"type": "boolean"}, "rx_bytes": {"$ref": "#/$defs/bytes"}, "tx_bytes": {"$ref": "#/$defs/bytes"}}
+          }
+        }
+      }
+    }
+  }
+}

@@ -2,6 +2,7 @@ package console
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"regexp"
 	"strings"
@@ -37,12 +38,28 @@ type publicTraffic struct {
 	Coverage         *float64 `json:"coverage_percent"`
 }
 type publicNode struct {
-	PublicID    string          `json:"public_id"`
-	DisplayName string          `json:"display_name"`
-	LastSeenAt  int64           `json:"last_seen_at"`
-	System      publicSystem    `json:"system"`
-	Resources   publicResources `json:"resources"`
-	Traffic     publicTraffic   `json:"traffic"`
+	Tags        []string                `json:"tags"`
+	PublicID    string                  `json:"public_id"`
+	DisplayName string                  `json:"display_name"`
+	LastSeenAt  int64                   `json:"last_seen_at"`
+	System      publicSystem            `json:"system"`
+	Resources   publicResources         `json:"resources"`
+	Traffic     publicTraffic           `json:"traffic"`
+	Status      publicNodeStatus        `json:"status"`
+	Telemetry   publicTelemetryEvidence `json:"telemetry"`
+}
+type publicNodeStatus struct {
+	Connectivity  string `json:"connectivity"`
+	Authorization string `json:"authorization"`
+	Telemetry     string `json:"telemetry"`
+	Health        string `json:"health"`
+}
+type publicTelemetryEvidence struct {
+	ObservedAt       *int64 `json:"observed_at"`
+	ReceivedAt       *int64 `json:"received_at"`
+	IntervalSeconds  int    `json:"interval_seconds"`
+	ClockSkew        bool   `json:"clock_skew"`
+	CollectionErrors int    `json:"collection_errors"`
 }
 type publicSummary struct {
 	GeneratedAt           int64        `json:"generated_at"`
@@ -52,14 +69,24 @@ type publicSummary struct {
 	Nodes                 []publicNode `json:"nodes"`
 }
 type historyPoint struct {
-	Timestamp int64    `json:"timestamp"`
-	CPU       *float64 `json:"cpu_percent"`
-	Memory    *float64 `json:"memory_percent"`
-	Disk      *float64 `json:"disk_percent"`
-	Inbound   *float64 `json:"inbound_percent"`
-	Outbound  *float64 `json:"outbound_percent"`
+	ReceivedAt                int64    `json:"received_at"`
+	CollectionIntervalSeconds int      `json:"collection_interval_seconds"`
+	CollectionErrors          int      `json:"collection_errors"`
+	ClockSkew                 bool     `json:"clock_skew"`
+	GapBefore                 bool     `json:"gap_before"`
+	InboundBPS                *float64 `json:"inbound_bps"`
+	OutboundBPS               *float64 `json:"outbound_bps"`
+	Timestamp                 int64    `json:"timestamp"`
+	CPU                       *float64 `json:"cpu_percent"`
+	Memory                    *float64 `json:"memory_percent"`
+	Disk                      *float64 `json:"disk_percent"`
+	Inbound                   *float64 `json:"inbound_percent"`
+	Outbound                  *float64 `json:"outbound_percent"`
 }
 type publicHistory struct {
+	Source                string         `json:"source"`
+	Aggregation           string         `json:"aggregation"`
+	SampleCount           int            `json:"sample_count"`
 	PublicID              string         `json:"public_id"`
 	Range                 string         `json:"range"`
 	WindowStart           int64          `json:"window_start"`
@@ -132,23 +159,49 @@ func projectResources(raw string, received int64) publicResources {
 	}
 	return out
 }
+
+// decodeObservation reads persisted, validated telemetry. Public responses are
+// always explicitly projected; raw sample identifiers and resource names stay private.
+func decodeObservation(raw string, received int64, skew bool) (*database.TelemetryObservation, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var sample protocol.TelemetrySample
+	if err := json.Unmarshal([]byte(raw), &sample); err != nil {
+		return nil, err
+	}
+	return &database.TelemetryObservation{TelemetrySample: sample, ReceivedAt: received, ClockSkew: skew}, nil
+}
+
+func projectObservation(sample *database.TelemetryObservation, now int64) (publicSystem, publicResources, publicTelemetryEvidence, database.TelemetryStatus) {
+	status := database.ProjectTelemetryStatus(sample, now)
+	evidence := publicTelemetryEvidence{IntervalSeconds: 60}
+	if sample == nil {
+		return publicSystem{}, publicResources{}, evidence, status
+	}
+	evidence = publicTelemetryEvidence{ptr(sample.ObservedAt), ptr(sample.ReceivedAt), sample.IntervalSeconds, sample.ClockSkew, len(sample.Errors)}
+	info, _ := json.Marshal(sample.System)
+	metrics, _ := json.Marshal(sample.Metrics)
+	return projectSystem(string(info), sample.ObservedAt), projectResources(string(metrics), sample.ObservedAt), evidence, status
+}
+
 func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 	if r.URL.RawQuery != "" {
 		problem(w, 400, "invalid_request")
 		return
 	}
 	now := s.now().Unix()
-	traffic, err := s.latestTraffic(r.Context(), now)
-	if err != nil {
-		storeProblem(w, err)
-		return
-	}
 	out := publicSummary{now, now - 3600, now, 60, []publicNode{}}
+	// Two indexed lookups per visible node, independent of the diagnostic queue.
 	rows, err := s.store.DB.QueryContext(r.Context(), `SELECT p.public_id,p.display_name,n.last_seen_at,
- COALESCE(i.payload,''),COALESCE(i.completed_at,0),COALESCE(m.payload,''),COALESCE(m.received_at,0)
+ CASE WHEN EXISTS(SELECT 1 FROM node_revocations WHERE node_id=n.id) THEN 'REVOKED' WHEN n.status='disabled' THEN 'DISABLED' ELSE 'ACTIVE' END,
+ (SELECT json_group_array(tag) FROM (SELECT tag FROM node_tags WHERE node_id=n.id ORDER BY tag)),
+ COALESCE((SELECT max(CASE WHEN severity='CRITICAL' THEN 2 ELSE 1 END) FROM alerts WHERE node_id=n.id AND status='FIRING'),0),
+ COALESCE(m.payload_json,''),COALESCE(m.received_at,0),COALESCE(m.clock_skew,0),
+ COALESCE(b.payload_json,''),COALESCE(b.received_at,0),COALESCE(b.clock_skew,0)
  FROM nodes n JOIN console_nodes p ON p.node_id=n.id
- LEFT JOIN results i ON i.task_id=(SELECT r.task_id FROM results r JOIN tasks t ON t.id=r.task_id WHERE r.node_id=n.id AND r.status='SUCCEEDED' AND t.task_type='system.info' ORDER BY r.received_at DESC,r.task_id DESC LIMIT 1)
- LEFT JOIN results m ON m.task_id=(SELECT r.task_id FROM results r JOIN tasks t ON t.id=r.task_id WHERE r.node_id=n.id AND r.status='SUCCEEDED' AND t.task_type='system.metrics' ORDER BY r.received_at DESC,r.task_id DESC LIMIT 1)
+ LEFT JOIN telemetry_samples m ON m.id=(SELECT id FROM telemetry_samples WHERE node_id=n.id ORDER BY observed_at DESC,sample_id DESC LIMIT 1)
+ LEFT JOIN telemetry_samples b ON b.id=(SELECT id FROM telemetry_samples WHERE node_id=n.id AND (observed_at,sample_id)<(m.observed_at,m.sample_id) ORDER BY observed_at DESC,sample_id DESC LIMIT 1)
  WHERE n.last_seen_at>0 ORDER BY p.public_id LIMIT 1001`)
 	if err != nil {
 		storeProblem(w, err)
@@ -157,25 +210,51 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	for rows.Next() {
 		var n publicNode
-		var info, metrics string
-		var completed, received int64
-		if err = rows.Scan(&n.PublicID, &n.DisplayName, &n.LastSeenAt, &info, &completed, &metrics, &received); err != nil {
+		var authorization, raw, beforeRaw, tags string
+		var alertSeverity int
+		var received, beforeReceived int64
+		var skew, beforeSkew bool
+		if err = rows.Scan(&n.PublicID, &n.DisplayName, &n.LastSeenAt, &authorization, &tags, &alertSeverity, &raw, &received, &skew, &beforeRaw, &beforeReceived, &beforeSkew); err != nil {
 			storeProblem(w, err)
 			return
 		}
-		// Only the administrator's validated public label may replace the opaque
-		// default; Agent-supplied hostname and other private text stay private.
 		if !database.ValidNodeName(n.DisplayName) {
 			n.DisplayName = ""
 		}
 		n.DisplayName = publicName(n.DisplayName, n.PublicID)
-		if info != "" {
-			n.System = projectSystem(info, completed)
+		if err = json.Unmarshal([]byte(tags), &n.Tags); err != nil {
+			storeProblem(w, err)
+			return
 		}
-		if metrics != "" {
-			n.Resources = projectResources(metrics, received)
+		current, e := decodeObservation(raw, received, skew)
+		if e != nil {
+			storeProblem(w, e)
+			return
 		}
-		n.Traffic = traffic[n.PublicID]
+		previous, e := decodeObservation(beforeRaw, beforeReceived, beforeSkew)
+		if e != nil {
+			storeProblem(w, e)
+			return
+		}
+		var status database.TelemetryStatus
+		n.System, n.Resources, n.Telemetry, status = projectObservation(current, now)
+		n.Status = publicNodeStatus{Connectivity: "UNKNOWN", Authorization: strings.ToUpper(authorization), Telemetry: status.Telemetry, Health: status.Health}
+		if status.Telemetry == "FRESH" && status.Health != "UNKNOWN" {
+			if alertSeverity == 2 {
+				n.Status.Health = "CRITICAL"
+			} else if alertSeverity == 1 && status.Health == "HEALTHY" {
+				n.Status.Health = "WARNING"
+			}
+		}
+		if n.LastSeenAt > 0 {
+			n.Status.Connectivity = "OFFLINE"
+			if now-n.LastSeenAt <= 90 && n.LastSeenAt <= now {
+				n.Status.Connectivity = "ONLINE"
+			}
+		}
+		if status.Telemetry == "FRESH" {
+			n.Traffic = projectTelemetryTraffic(previous, current)
+		}
 		out.Nodes = append(out.Nodes, n)
 	}
 	if err = rows.Err(); err != nil {
@@ -188,6 +267,7 @@ func (s *Server) summary(w http.ResponseWriter, r *http.Request) {
 	}
 	reply(w, out)
 }
+
 func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	if !listParams(w, r, "range") {
 		return
@@ -211,6 +291,9 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 	case "7d":
 		window = 7 * 86400
 		interval = 900
+	case "30d":
+		window = 30 * 86400
+		interval = 1800
 	default:
 		problem(w, 400, "invalid_request")
 		return
@@ -226,26 +309,61 @@ func (s *Server) history(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := s.now().Unix()
-	out := publicHistory{id, span, now - window, now, interval, []historyPoint{}}
-	// Latest real result within each display bucket; never interpolate samples.
-	rows, err := s.store.DB.QueryContext(r.Context(), `SELECT payload,received_at FROM (
- SELECT r.payload,r.received_at,row_number() OVER (PARTITION BY r.received_at/? ORDER BY r.received_at DESC,r.task_id DESC) AS pos
- FROM results r JOIN tasks t ON t.id=r.task_id WHERE r.node_id=? AND r.status='SUCCEEDED' AND t.task_type='system.metrics' AND r.received_at>=? AND r.received_at<=?
- ) WHERE pos=1 ORDER BY received_at LIMIT 2000`, interval, node, out.WindowStart, now)
+	out := publicHistory{Source: "telemetry", Aggregation: "latest_per_bucket", PublicID: id, Range: span, WindowStart: now - window, WindowEnd: now, SampleIntervalSeconds: interval, Points: []historyPoint{}}
+	// Scan only the indexed, bounded node/time window. Rank identifiers rather
+	// than payloads; the response retains the latest real observation per bucket.
+	// The count exposes aggregation explicitly, including all 30 days of data.
+	rows, err := s.store.DB.QueryContext(r.Context(), `WITH ordered AS (
+ SELECT id,observed_at,sample_id,boot_id,interval_seconds,
+ lag(observed_at) OVER (ORDER BY observed_at,sample_id) AS prior_at,
+ lag(boot_id) OVER (ORDER BY observed_at,sample_id) AS prior_boot,
+ lag(interval_seconds) OVER (ORDER BY observed_at,sample_id) AS prior_interval
+ FROM telemetry_samples WHERE node_id=? AND observed_at>=? AND observed_at<=?
+ ), ranked AS (
+ SELECT id,count(*) OVER (PARTITION BY observed_at/?) AS samples,
+ max(CASE WHEN prior_at IS NOT NULL AND (prior_boot!=boot_id OR observed_at-prior_at>max(180,3*max(interval_seconds,prior_interval))) THEN 1 ELSE 0 END) OVER (PARTITION BY observed_at/?) AS bucket_gap,
+ row_number() OVER (PARTITION BY observed_at/? ORDER BY observed_at DESC,sample_id DESC) AS pos
+ FROM ordered
+ ) SELECT m.payload_json,m.received_at,m.clock_skew,ranked.samples,ranked.bucket_gap,
+ COALESCE(b.payload_json,''),COALESCE(b.received_at,0),COALESCE(b.clock_skew,0)
+ FROM ranked JOIN telemetry_samples m ON m.id=ranked.id
+ LEFT JOIN telemetry_samples b ON b.id=(SELECT id FROM telemetry_samples WHERE node_id=m.node_id AND (observed_at,sample_id)<(m.observed_at,m.sample_id) ORDER BY observed_at DESC,sample_id DESC LIMIT 1)
+ WHERE ranked.pos=1 ORDER BY m.observed_at,m.sample_id LIMIT 2000`, node, out.WindowStart, now, interval, interval, interval)
 	if err != nil {
 		storeProblem(w, err)
 		return
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var raw string
-		var at int64
-		if err = rows.Scan(&raw, &at); err != nil {
+		var raw, beforeRaw string
+		var received, beforeReceived int64
+		var skew, beforeSkew, bucketGap bool
+		var count int
+		if err = rows.Scan(&raw, &received, &skew, &count, &bucketGap, &beforeRaw, &beforeReceived, &beforeSkew); err != nil {
 			storeProblem(w, err)
 			return
 		}
-		m := projectResources(raw, at)
-		out.Points = append(out.Points, historyPoint{Timestamp: at, CPU: m.CPU, Memory: m.Memory, Disk: m.Disk})
+		current, e := decodeObservation(raw, received, skew)
+		if e != nil {
+			storeProblem(w, e)
+			return
+		}
+		previous, e := decodeObservation(beforeRaw, beforeReceived, beforeSkew)
+		if e != nil {
+			storeProblem(w, e)
+			return
+		}
+		_, resources, _, _ := projectObservation(current, now)
+		traffic := projectTelemetryTraffic(previous, current)
+		gap := bucketGap || previous == nil || current.BootID != previous.BootID || current.ObservedAt-previous.ObservedAt > int64(max(180, 3*max(current.IntervalSeconds, previous.IntervalSeconds)))
+		point := historyPoint{Timestamp: current.ObservedAt, ReceivedAt: current.ReceivedAt, CollectionIntervalSeconds: current.IntervalSeconds, CollectionErrors: len(current.Errors), ClockSkew: current.ClockSkew, GapBefore: gap, CPU: resources.CPU, Memory: resources.Memory, Disk: resources.Disk, InboundBPS: traffic.Inbound, OutboundBPS: traffic.Outbound}
+		if current.ClockSkew {
+			point.CPU = nil
+			point.Memory = nil
+			point.Disk = nil
+		}
+		out.SampleCount += count
+		out.Points = append(out.Points, point)
 	}
 	if err = rows.Err(); err != nil {
 		storeProblem(w, err)

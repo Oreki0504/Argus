@@ -92,10 +92,17 @@ export function AgentsPage() {
                         <small>
                           {agent.hostname} · {agent.node_id}
                         </small>
+                        <small>{agent.tags.join(' · ')}</small>
                       </th>
                       <td>
                         <div className="stacked-status">
-                          <Status>{agent.status === 'active' ? 'Active' : 'Disabled'}</Status>
+                          <Status>
+                            {agent.authorization === 'REVOKED'
+                              ? 'Revoked'
+                              : agent.status === 'active'
+                                ? 'Active'
+                                : 'Disabled'}
+                          </Status>
                           <span title={timestampLabel(agent.last_seen_at)}>
                             {t(heartbeat(agent.last_seen_at, now))} ·{' '}
                             {relativeTime(agent.last_seen_at, now)}
@@ -157,13 +164,22 @@ function AgentActionsDialog({ agent, onClose }: { agent: ManagedAgent; onClose: 
   const { t } = usePreferences()
   const { identity } = useManagement()
   const client = useQueryClient()
-  const [mode, setMode] = useState<'actions' | 'rename' | 'disable' | 'delete'>('actions')
+  const [mode, setMode] = useState<'actions' | 'rename' | 'disable' | 'delete' | 'tags' | 'revoke'>(
+    'actions',
+  )
   const [confirmation, setConfirmation] = useState('')
+  const [tags, setTags] = useState(agent.tags.join(', '))
+  const tagValues = tags
+    .split(',')
+    .map((tag) => tag.trim())
+    .filter(Boolean)
   const [name, setName] = useState(agent.display_name)
   const mutation = useMutation({
     mutationFn: async () => {
       if (mode === 'rename')
         await management.rename(agent.node_id, name.trim(), identity.csrf_token)
+      else if (mode === 'tags') await management.tags(agent.node_id, tagValues, identity.csrf_token)
+      else if (mode === 'revoke') await management.revoke(agent.node_id, identity.csrf_token)
       else if (mode === 'delete')
         await management.remove(agent.node_id, confirmation, identity.csrf_token)
       else await management.disable(agent.node_id, confirmation, identity.csrf_token)
@@ -175,11 +191,23 @@ function AgentActionsDialog({ agent, onClose }: { agent: ManagedAgent; onClose: 
     },
   })
   const action =
-    mode === 'rename' ? 'Rename agent' : mode === 'delete' ? 'Delete agent' : 'Disable agent'
+    mode === 'tags'
+      ? 'Edit tags'
+      : mode === 'revoke'
+        ? 'Revoke identity'
+        : mode === 'rename'
+          ? 'Rename agent'
+          : mode === 'delete'
+            ? 'Delete agent'
+            : 'Disable agent'
   const valid =
-    mode === 'rename'
-      ? name.trim().length > 0 && name.trim().length <= 64
-      : confirmation === agent.node_id
+    mode === 'tags'
+      ? tagValues.length <= 16 &&
+        new Set(tagValues).size === tagValues.length &&
+        tagValues.every((tag) => /^[A-Za-z0-9_.:-]{1,32}$/.test(tag))
+      : mode === 'rename'
+        ? name.trim().length > 0 && name.trim().length <= 64
+        : confirmation === agent.node_id
   return (
     <Dialog
       title={mode === 'actions' ? agent.display_name : t(action)}
@@ -197,7 +225,21 @@ function AgentActionsDialog({ agent, onClose }: { agent: ManagedAgent; onClose: 
             if (valid) mutation.mutate()
           }}
         >
-          {mode === 'rename' ? (
+          {mode === 'tags' ? (
+            <>
+              <Notice>
+                {t(
+                  'Tags are visible in the public overview. Use up to 16 labels separated by commas.',
+                )}
+              </Notice>
+              <label htmlFor="agent-tags">{t('Tags')}</label>
+              <input
+                id="agent-tags"
+                value={tags}
+                onChange={(event) => setTags(event.target.value)}
+              />
+            </>
+          ) : mode === 'rename' ? (
             <>
               <p>
                 {t(
@@ -217,9 +259,11 @@ function AgentActionsDialog({ agent, onClose }: { agent: ManagedAgent; onClose: 
             <>
               <Notice kind="warning">
                 {t(
-                  mode === 'delete'
-                    ? 'Delete this agent and its task and metric history. Its credentials will stop working. Audit records remain. This does not uninstall software on the host.'
-                    : 'Disabling rejects this agent’s future requests and affects unfinished tasks. There is no re-enable action; reconnecting requires new enrollment.',
+                  mode === 'revoke'
+                    ? 'Revoking permanently rejects this identity. New enrollment is required to reconnect.'
+                    : mode === 'delete'
+                      ? 'Delete this agent and its task and metric history. Its credentials will stop working. Audit records remain. This does not uninstall software on the host.'
+                      : 'Disabling rejects this agent’s future requests and affects unfinished tasks. There is no re-enable action; reconnecting requires new enrollment.',
                 )}
               </Notice>
               <label htmlFor="agent-confirm">{t('Type the agent ID to confirm')}</label>
@@ -248,7 +292,7 @@ function AgentActionsDialog({ agent, onClose }: { agent: ManagedAgent; onClose: 
               {t('Back')}
             </button>
             <button
-              className={mode === 'rename' ? 'button primary' : 'button danger'}
+              className={mode === 'rename' || mode === 'tags' ? 'button primary' : 'button danger'}
               disabled={mutation.isPending || !valid || uncertainWrite(mutation.error)}
             >
               {t(mutation.isPending ? 'Submitting…' : action)}
@@ -275,6 +319,14 @@ function AgentActionsDialog({ agent, onClose }: { agent: ManagedAgent; onClose: 
                 <Pencil size={16} />
                 {t('Rename agent')}
               </button>
+              <button className="button secondary" onClick={() => setMode('tags')}>
+                {t('Edit tags')}
+              </button>
+              {agent.authorization !== 'REVOKED' && (
+                <button className="button danger" onClick={() => setMode('revoke')}>
+                  {t('Revoke identity')}
+                </button>
+              )}
               {agent.status === 'active' && (
                 <button className="button danger" onClick={() => setMode('disable')}>
                   <ShieldOff size={16} />

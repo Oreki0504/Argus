@@ -37,6 +37,49 @@
     "completed_at": {
       "type": "integer",
       "minimum": 1
+    },
+    "collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "boot_id", "collector_version", "started_at", "completed_at", "duration_ms", "coverage", "resources_total", "resources_available", "truncated"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+        "boot_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,64}$"},
+        "collector_version": {"type": "string", "minLength": 1, "maxLength": 64},
+        "started_at": {"type": "integer", "minimum": 1},
+        "completed_at": {"type": "integer", "minimum": 1},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "coverage": {"enum": ["complete", "partial", "unavailable"]},
+        "resources_total": {"type": "integer", "minimum": 0, "maximum": 32},
+        "resources_available": {"type": "integer", "minimum": 0, "maximum": 32},
+        "truncated": {"type": "boolean"},
+        "listener_processes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["coverage", "scanned_processes", "scanned_fds", "items"],
+          "properties": {
+            "coverage": {"enum": ["complete", "partial", "unavailable"]},
+            "scanned_processes": {"type": "integer", "minimum": 0, "maximum": 4096},
+            "scanned_fds": {"type": "integer", "minimum": 0, "maximum": 16384},
+            "items": {
+              "type": "array", "maxItems": 128,
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["protocol", "address", "port", "pid", "process_name", "process_start_ticks", "socket_inode"],
+                "properties": {
+                  "protocol": {"enum": ["tcp", "tcp6", "udp", "udp6"]},
+                  "address": {"type": "string"},
+                  "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                  "pid": {"type": "integer", "minimum": 1},
+                  "process_name": {"type": "string", "maxLength": 64},
+                  "process_start_ticks": {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"},
+                  "socket_inode": {"type": "string", "pattern": "^[1-9][0-9]{0,19}$"}
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

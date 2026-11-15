@@ -224,3 +224,50 @@ test('uncertain production writes are not automatically retried or reported as s
   expect(writes).toBe(1)
   await expect(page).toHaveURL(/\/manage\/tasks\?new=1$/)
 })
+
+test('diagnostic profiles create a traceable multi-node batch and alerts retain rule controls', async ({
+  page,
+}) => {
+  await page.goto('/manage/tasks?scenario=admin')
+  await page.getByRole('button', { name: 'Run diagnostic profile', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Run diagnostic profile', exact: true })
+  await dialog.getByRole('combobox', { name: 'Diagnostic profile' }).selectOption('system')
+  await dialog.getByRole('checkbox', { name: /Production · North/ }).check()
+  await dialog.getByRole('checkbox', { name: /Production · West/ }).check()
+  await dialog.getByRole('button', { name: 'Run diagnostic profile', exact: true }).click()
+  await expect(dialog.getByText(/Diagnostic batch created/)).toBeVisible()
+  await expect(dialog.getByRole('link', { name: 'system.info', exact: true })).toHaveCount(2)
+  await expect(dialog.getByRole('link', { name: 'system.metrics', exact: true })).toHaveCount(2)
+  await dialog.getByRole('button', { name: 'Close dialog' }).click()
+  await page
+    .getByRole('navigation', { name: 'Management sections' })
+    .getByRole('link', { name: 'Alerts', exact: true })
+    .click()
+  await expect(page.getByRole('heading', { name: 'Alert events', exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'New alert rule' }).click()
+  const rule = page.getByRole('dialog', { name: 'Alert rule', exact: true })
+  await rule.getByRole('textbox', { name: 'Rule ID' }).fill('cpu-warning')
+  await rule.getByRole('spinbutton', { name: 'Threshold (%)' }).fill('85')
+  await rule.getByRole('button', { name: 'Save rule' }).click()
+  await expect(page.getByRole('row').filter({ hasText: 'cpu-warning' })).toContainText('85%')
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
+})
+
+test('node tags are editable and identity revocation requires matching confirmation', async ({
+  page,
+}) => {
+  await page.goto('/manage/agents?scenario=admin')
+  await page.getByRole('button', { name: 'Manage Production · North' }).click()
+  await page.getByRole('button', { name: 'Edit tags' }).click()
+  await page.getByRole('textbox', { name: 'Tags', exact: true }).fill('prod, region:jp')
+  await page.getByRole('button', { name: 'Edit tags', exact: true }).click()
+  const row = page.getByRole('row').filter({ hasText: 'Production · North' })
+  await expect(row).toContainText('prod · region:jp')
+  await page.getByRole('button', { name: 'Manage Production · North' }).click()
+  await page.getByRole('button', { name: 'Revoke identity' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Revoke identity' })
+  await expect(dialog.getByRole('button', { name: 'Revoke identity', exact: true })).toBeDisabled()
+  await dialog.getByRole('textbox', { name: 'Type the agent ID to confirm' }).fill('node-0001')
+  await dialog.getByRole('button', { name: 'Revoke identity', exact: true }).click()
+  await expect(row.getByText('Revoked', { exact: true })).toBeVisible()
+})

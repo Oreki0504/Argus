@@ -8,7 +8,7 @@ import type { HistoryRange } from '../../api/contracts'
 import { consoleKey } from '../../api/query'
 import { useViewer } from '../auth/context'
 import { ErrorState, Loading } from '../../components/ui'
-import { metrics } from '../../lib/utilization'
+import { historyMetrics as metrics } from '../../lib/utilization'
 import { UtilizationChart } from './UtilizationChart'
 
 export function NodeHistory({
@@ -20,7 +20,7 @@ export function NodeHistory({
   range: HistoryRange
   children?: ReactNode
 }) {
-  const { timestampLabel, utilizationLabel } = useFormat()
+  const { timestampLabel, utilizationLabel, quantity } = useFormat()
   const { t } = usePreferences()
   const dialog = useRef<HTMLDialogElement>(null)
   const identity = useViewer()
@@ -53,7 +53,7 @@ export function NodeHistory({
         <p>
           {timestampLabel(history.window_start)} — {timestampLabel(history.window_end)}
           <span>
-            {t('Sampling interval {seconds}s', { seconds: history.sample_interval_seconds })}
+            {t('Display bucket {seconds}s', { seconds: history.sample_interval_seconds })}
           </span>
         </p>
         {history.points.length > 0 && (
@@ -62,6 +62,12 @@ export function NodeHistory({
           </button>
         )}
       </div>
+      <p className="history-evidence">
+        {t(
+          '{samples} observations · {points} displayed samples. Each bucket shows its latest observation; gaps remain unmeasured.',
+          { samples: history.sample_count, points: history.points.length },
+        )}
+      </p>
       <div className="history-grid">
         {metrics.map((metric) => (
           <UtilizationChart
@@ -98,14 +104,18 @@ export function NodeHistory({
           >
             <table>
               <caption className="sr-only">
-                {t('Timestamped utilization percentages. A dash means unmeasured, not zero.')}
+                {t(
+                  'Timestamped telemetry. Throughput is in bits per second. A dash means unmeasured, not zero.',
+                )}
               </caption>
               <thead>
                 <tr>
-                  <th scope="col">{t('Time')}</th>
+                  <th scope="col">{t('Observed')}</th>
+                  <th scope="col">{t('Received')}</th>
+                  <th scope="col">{t('Collection errors')}</th>
                   {metrics.map((metric) => (
                     <th key={metric.key} scope="col">
-                      {t(metric.label)} %
+                      {t(metric.label)} {metric.key.endsWith('_bps') ? 'bit/s' : '%'}
                     </th>
                   ))}
                 </tr>
@@ -114,11 +124,18 @@ export function NodeHistory({
                 {history.points.map((point) => (
                   <tr key={point.timestamp}>
                     <th scope="row">{timestampLabel(point.timestamp)}</th>
+                    <td>{timestampLabel(point.received_at)}</td>
+                    <td>
+                      {point.collection_errors}
+                      {point.clock_skew ? ` · ${t('Clock skew')}` : ''}
+                    </td>
                     {metrics.map((metric) => (
                       <td className="numeric" key={metric.key}>
                         {point[metric.key] === null
                           ? t('Unmeasured')
-                          : utilizationLabel(point[metric.key])}
+                          : metric.key.endsWith('_bps')
+                            ? quantity(point[metric.key], 'rate')
+                            : utilizationLabel(point[metric.key])}
                       </td>
                     ))}
                   </tr>

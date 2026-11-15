@@ -1784,6 +1784,32 @@
     margin-left: auto;
   }
 
+  .provider-guide {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .provider-guide code {
+    display: block;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    margin: 6px 0;
+  }
+
+  @media (max-width: 600px) {
+    .account-provider {
+      flex-wrap: wrap;
+    }
+    .account-provider > .muted {
+      max-width: 100%;
+      overflow-wrap: anywhere;
+    }
+    .account-configuration {
+      padding: 16px;
+      min-width: 0;
+    }
+  }
+
   .provider-fields {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));

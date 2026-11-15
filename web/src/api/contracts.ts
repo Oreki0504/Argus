@@ -69,7 +69,21 @@ export const accountSchema = z.strictObject({
 export const publicNodeSchema = z.strictObject({
   public_id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
   display_name: z.string(),
+  tags: z.array(z.string().max(32)).max(16),
   last_seen_at: timestamp,
+  status: z.strictObject({
+    connectivity: z.enum(['ONLINE', 'OFFLINE', 'UNKNOWN']),
+    authorization: z.enum(['ACTIVE', 'DISABLED', 'REVOKED']),
+    telemetry: z.enum(['FRESH', 'STALE', 'MISSING']),
+    health: z.enum(['HEALTHY', 'WARNING', 'CRITICAL', 'UNKNOWN']),
+  }),
+  telemetry: z.strictObject({
+    observed_at: timestamp.nullable(),
+    received_at: timestamp.nullable(),
+    interval_seconds: z.number().int().min(30).max(300),
+    clock_skew: z.boolean(),
+    collection_errors: z.number().int().min(0).max(32),
+  }),
   system: z.strictObject({
     os: z.string().nullable(),
     architecture: z.string().nullable(),
@@ -103,10 +117,17 @@ export const summarySchema = z.strictObject({
 })
 export type Summary = z.infer<typeof summarySchema>
 
-export const historyRangeSchema = z.enum(['1h', '24h', '7d'])
+export const historyRangeSchema = z.enum(['1h', '24h', '7d', '30d'])
 export type HistoryRange = z.infer<typeof historyRangeSchema>
 export const historyPointSchema = z.strictObject({
   timestamp,
+  received_at: timestamp,
+  collection_interval_seconds: z.number().int().min(30).max(300),
+  collection_errors: z.number().int().min(0).max(32),
+  clock_skew: z.boolean(),
+  gap_before: z.boolean(),
+  inbound_bps: z.number().nonnegative().nullable(),
+  outbound_bps: z.number().nonnegative().nullable(),
   cpu_percent: percentage,
   memory_percent: percentage,
   disk_percent: percentage,
@@ -118,6 +139,9 @@ export const historyPointSchema = z.strictObject({
 export type HistoryPoint = z.infer<typeof historyPointSchema>
 export const nodeHistorySchema = z
   .strictObject({
+    source: z.literal('telemetry'),
+    aggregation: z.literal('latest_per_bucket'),
+    sample_count: z.number().int().nonnegative(),
     public_id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
     range: historyRangeSchema,
     window_start: timestamp,

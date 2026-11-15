@@ -76,7 +76,10 @@ func Client(ca, cert, key string) (*http.Client, error) {
 		}
 		config.Certificates = []tls.Certificate{pair}
 	}
-	return &http.Client{Timeout: 40 * time.Second, Transport: &http.Transport{TLSClientConfig: config, MaxConnsPerHost: 2, MaxIdleConnsPerHost: 2, IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 35 * time.Second, MaxResponseHeaderBytes: 16384}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirects are disabled") }}, nil
+	// Reserve bounded independent connections for heartbeat/renewal, diagnostic
+	// delivery, telemetry delivery, and capability reporting. Slow uploads must
+	// not occupy every connection available to heartbeat communication.
+	return &http.Client{Timeout: 40 * time.Second, Transport: &http.Transport{TLSClientConfig: config, MaxConnsPerHost: 4, MaxIdleConnsPerHost: 4, IdleConnTimeout: 30 * time.Second, ResponseHeaderTimeout: 35 * time.Second, MaxResponseHeaderBytes: 16384}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirects are disabled") }}, nil
 }
 func ValidateURL(raw string) error {
 	u, e := url.Parse(raw)

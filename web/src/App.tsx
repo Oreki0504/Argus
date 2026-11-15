@@ -16,6 +16,7 @@ import { TrafficPage } from './features/traffic/Traffic'
 import { ManagementLayout } from './features/management/ManagementLayout'
 import { TasksPage, TaskDetailPage } from './features/management/Tasks'
 import { AgentsPage } from './features/management/Agents'
+import { AlertsPage } from './features/management/Alerts'
 import { AuditPage } from './features/management/Audit'
 import { UsersPage } from './features/management/Users'
 
@@ -62,6 +63,7 @@ export function App() {
               <Route path="tasks/:taskId" element={<TaskDetailPage />} />
               <Route path="agents" element={<AgentsPage />} />
               <Route path="audit" element={<AuditPage />} />
+              <Route path="alerts" element={<AlertsPage />} />
               <Route path="users" element={<UsersPage />} />
             </Route>
           </Route>

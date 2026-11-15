@@ -265,7 +265,7 @@ export function makeHandlers(scenario: Scenario) {
       if (scenario === 'unavailable') return problem('service_unavailable', 503)
       return reply(summary())
     }),
-    http.get('/v1/console/nodes/:id/history', async ({ request, params }) => {
+    http.get('/v1/console/nodes/:id/telemetry', async ({ request, params }) => {
       if (!session) return problem('session_expired', 401)
       if (scenario === 'forbidden' || scenario === 'no-capability') return problem('forbidden', 403)
       return history(request, String(params.id))
@@ -276,7 +276,7 @@ export function makeHandlers(scenario: Scenario) {
       if (scenario === 'unavailable') return problem('service_unavailable', 503)
       return reply(summary())
     }),
-    http.get('/v1/console/public/nodes/:id/history', ({ request, params }) => {
+    http.get('/v1/console/public/nodes/:id/telemetry', ({ request, params }) => {
       if (!active) return problem('forbidden', 403)
       if (scenario === 'unavailable') return problem('service_unavailable', 503)
       return history(request, String(params.id))

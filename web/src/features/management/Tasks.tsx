@@ -14,6 +14,7 @@ import { usePreferences } from '../../preferences/context'
 import { useFormat } from '../../lib/useFormat'
 import { EmptyState, ErrorState, Loading, Notice, Status } from '../../components/ui'
 import { canManage } from './access'
+import { DiagnosticsPanel } from './Diagnostics'
 import { AuditLink, Dialog, MutationError, Pager, SectionHeading } from './shared'
 
 export function TasksPage() {
@@ -65,6 +66,7 @@ export function TasksPage() {
           </button>
         )}
       </SectionHeading>
+      {writable && <DiagnosticsPanel />}
       <div className="management-filters">
         <input
           aria-label={t('Filter by agent ID')}
@@ -346,13 +348,20 @@ function NewTaskDialog({
 
 export function TaskDetailPage() {
   const { taskId = '' } = useParams()
-  const { identity, key } = useManagement()
+  const { identity, key, refresh } = useManagement()
   const { t } = usePreferences()
   const { timestampLabel } = useFormat()
   const [raw, setRaw] = useState(false)
   const query = useQuery({
     queryKey: [...key, 'task', taskId],
     queryFn: ({ signal }) => management.task(taskId, signal),
+  })
+  const cancel = useMutation({
+    mutationFn: () => management.cancelTask(taskId, identity.csrf_token),
+    onSuccess: () => {
+      void refresh()
+      void query.refetch()
+    },
   })
   if (query.isPending) return <Loading label="Loading task" />
   if (query.isError) return <ErrorState error={query.error} retry={() => void query.refetch()} />
@@ -370,7 +379,17 @@ export function TaskDetailPage() {
         refresh={() => void query.refetch()}
       >
         <Status>{task.status}</Status>
+        {task.status === 'PENDING' && canManage(identity, 'tasks:write') && (
+          <button
+            className="button secondary"
+            disabled={cancel.isPending}
+            onClick={() => cancel.mutate()}
+          >
+            {t('Cancel pending task')}
+          </button>
+        )}
       </SectionHeading>
+      <MutationError error={cancel.error} />
       <div className="task-detail-columns">
         <section className="panel management-facts">
           <h3>{t('Dispatch details')}</h3>
@@ -420,6 +439,93 @@ export function TaskDetailPage() {
                 {t('Completed')} {timestampLabel(result.completed_at)}
               </p>
               {result.error && <Notice kind="warning">{t(result.error)}</Notice>}
+              <dl className="result-evidence">
+                <div>
+                  <dt>{t('Coverage')}</dt>
+                  <dd>
+                    {t(result.evidence.coverage)} · {result.evidence.resources_available}/
+                    {result.evidence.resources_total} {t('resources available')}
+                  </dd>
+                </div>
+                <div>
+                  <dt>{t('Truncated output')}</dt>
+                  <dd>{t(result.evidence.truncated ? 'Yes' : 'No')}</dd>
+                </div>
+                {result.collection && (
+                  <>
+                    <div>
+                      <dt>{t('Collection ID')}</dt>
+                      <dd>{result.collection.id}</dd>
+                    </div>
+                    <div>
+                      <dt>{t('Agent boot ID')}</dt>
+                      <dd>{result.collection.boot_id}</dd>
+                    </div>
+                    <div>
+                      <dt>{t('Collector version')}</dt>
+                      <dd>{result.collection.collector_version}</dd>
+                    </div>
+                    <div>
+                      <dt>{t('Collection started')}</dt>
+                      <dd>{timestampLabel(result.collection.started_at)}</dd>
+                    </div>
+                    <div>
+                      <dt>{t('Collection completed')}</dt>
+                      <dd>{timestampLabel(result.collection.completed_at)}</dd>
+                    </div>
+                    <div>
+                      <dt>{t('Duration (ms)')}</dt>
+                      <dd>{result.collection.duration_ms}</dd>
+                    </div>
+                  </>
+                )}
+              </dl>
+              {result.collection?.listener_processes && (
+                <section className="listener-associations">
+                  <h3>{t('Listener process evidence')}</h3>
+                  <p>
+                    {t('Coverage')}: {t(result.collection.listener_processes.coverage)} ·{' '}
+                    {result.collection.listener_processes.scanned_processes}{' '}
+                    {t('processes scanned')}
+                  </p>
+                  <div className="table-scroll">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>{t('Listener')}</th>
+                          <th>PID</th>
+                          <th>{t('Process')}</th>
+                          <th>{t('Process start ticks')}</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {result.collection.listener_processes.items.map((item, index) => (
+                          <tr key={index}>
+                            <td>
+                              {item.protocol} {item.address}:{item.port}
+                            </td>
+                            <td>{item.pid}</td>
+                            <td>{item.process_name}</td>
+                            <td>{item.process_start_ticks}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              )}
+              {!result.collection && (
+                <p className="muted">
+                  {t(
+                    'Collection metadata is unavailable for this report. Coverage is derived from its preserved payload.',
+                  )}
+                </p>
+              )}
+              {result.evidence.coverage === 'partial' && (
+                <Notice>
+                  {t('Some resources were unavailable. The available evidence is preserved below.')}
+                </Notice>
+              )}
               {raw ? (
                 <pre className="json-result" tabIndex={0}>
                   {JSON.stringify(result, null, 2)}

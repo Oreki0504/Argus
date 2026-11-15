@@ -899,6 +899,31 @@ def inspect_update_plan(component, arch):
             'state': state, 'unit': unit, 'files': files, 'active': active}
 
 
+def validate_agent_data(validation, command, storage_output):
+    """Probe schema 101 alone does not prove compatibility with newer state."""
+    state = validation / 'state'
+    if (state / 'telemetry.db').exists():
+        try:
+            storage = json.loads(storage_output)
+        except (ValueError, TypeError) as error:
+            raise InstallError('Candidate Agent did not report retained telemetry storage compatibility.') from error
+        if not isinstance(storage, dict) or any(not isinstance(storage.get(key), dict)
+                                               for key in ('telemetry', 'telemetry_storage')):
+            raise InstallError('Candidate Agent cannot validate retained telemetry storage. Use a compatible release; data was not changed.')
+    # Exercise the candidate's actual Result decoder on the private copy. Older
+    # Agents can pass `storage` while rejecting the optional collection envelope.
+    # One representative suffices for this format boundary; avoid exporting the
+    # whole diagnostic history or relying on a version string as compatibility.
+    with contextlib.closing(sqlite3.connect((state / 'probe.db').as_uri() + '?mode=ro', uri=True, timeout=5)) as db:
+        deadline = time.monotonic() + 60
+        db.set_progress_handler(lambda: time.monotonic() > deadline, 10000)
+        result = db.execute("SELECT id FROM executions WHERE result<>'' AND "
+                            "json_type(result, '$.collection') IS NOT NULL LIMIT 1").fetchone()
+    if result:
+        run([*command, 'result-export', '-config', validation / 'config.json',
+             '-task', result[0], '-out', validation / 'compatibility-result.json'])
+
+
 def validate_update(plan, bundle, snapshot, *, allow_migration=True):
     plan['stage'] = 'checking_database_snapshot'
     component, account = plan['component'], plan['account']
@@ -919,15 +944,19 @@ def validate_update(plan, bundle, snapshot, *, allow_migration=True):
             os.chown(current, account.pw_uid, account.pw_gid)
             for name in files:
                 os.chown(Path(current) / name, account.pw_uid, account.pw_gid)
-        migrate = allow_migration and component == 'server' and expected[1] in (102, 103)
+        migrate = allow_migration and component == 'server' and expected[1] in (102, 103, 104)
         if migrate:
             plan['stage'] = 'migrating_database_copy'
-            run(['runuser', '-u', account.pw_name, '--', validation / 'candidate', 'console-migrate',
+            migration_command = 'telemetry-migrate' if expected[1] == 104 else 'console-migrate'
+            run(['runuser', '-u', account.pw_name, '--', validation / 'candidate', migration_command,
                  '-config', validation / 'config.json', '-backup', validation / 'before-migration.db'])
-            expected = (expected_id, 104)
+            expected = (expected_id, 105)
         plan['stage'] = 'checking_candidate_storage'
-        run(['runuser', '-u', account.pw_name, '--', validation / 'candidate', 'storage',
-             '-config', validation / 'config.json'])
+        command = ['runuser', '-u', account.pw_name, '--', validation / 'candidate']
+        storage = run([*command, 'storage', '-config', validation / 'config.json'])
+        if component == 'agent':
+            plan['stage'] = 'checking_agent_data_compatibility'
+            validate_agent_data(validation, command, storage.stdout)
         if database_stamp(validation / 'state', component) != expected:
             raise InstallError('Automatic updates cannot migrate the database schema. Use the explicit migration procedure.')
         if component == 'server':
@@ -1077,7 +1106,7 @@ def update_component(args, plan, bundle):
                 # A durable original snapshot already exists in the backup.
                 upgraded_bytes = read_bounded(plan['migration_db'], 1 << 30)
                 metadata['phase'] = 'migrating'
-                metadata['target_schema'] = 104
+                metadata['target_schema'] = 105
                 replace_file(backup / 'update.json', (json.dumps(metadata, indent=2) + '\n').encode(), 0o600)
                 with contextlib.closing(sqlite3.connect(plan['state'] / 'argus.db', timeout=5)) as db:
                     if db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] != 0:
@@ -1100,14 +1129,16 @@ def update_component(args, plan, bundle):
         replace_file(backup / 'update.json', (json.dumps(metadata, indent=2) + '\n').encode(), 0o600)
     except (Exception, KeyboardInterrupt) as error:
         metadata['failure'] = record_failure(backup, plan, error)
-        if migrated:
+        if migrated or component == 'agent' and candidate_started:
             # Do not rewind a schema-changing update after traffic may have
-            # been accepted, or start an old binary against schema 104.
+            # been accepted, or start an old binary against the new schema.
+            # Agent Result envelopes can also change while probe.db stays at
+            # schema 101. Once started, the candidate may have committed them.
             run(['systemctl', 'stop', unit], check=False)
-            metadata['phase'] = 'migration_needs_recovery'
+            metadata['phase'] = 'migration_needs_recovery' if migrated else 'agent_needs_recovery'
             metadata['candidate_started'] = candidate_started
             replace_file(backup / 'update.json', (json.dumps(metadata, indent=2) + '\n').encode(), 0o600)
-            raise InstallError(f'Schema replacement or service verification failed. New programs and current database were preserved, service stopped. Inspect journalctl -u {unit}; backup: {backup}. Do not restart an older binary or rewind state after traffic was accepted.') from error
+            raise InstallError(f'Update requires manual recovery after schema replacement or candidate startup. New programs and current database were preserved, service stopped. Inspect journalctl -u {unit}; backup: {backup}. Do not restart an older binary or rewind state after traffic was accepted.') from error
         try:
             if replaced:
                 run(['systemctl', 'stop', unit])

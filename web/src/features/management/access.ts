@@ -2,6 +2,7 @@ import type { Capability, Identity } from '../../api/contracts'
 
 export const managementSections = [
   { path: 'tasks', label: 'Tasks', capability: 'tasks:read' },
+  { path: 'alerts', label: 'Alerts', capability: 'audit:read' },
   { path: 'agents', label: 'Agents', capability: 'agents:read' },
   { path: 'audit', label: 'Audit', capability: 'audit:read' },
   { path: 'users', label: 'Users & access', capability: 'users:read' },

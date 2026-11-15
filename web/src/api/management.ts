@@ -2,6 +2,16 @@ import { ApiError, request } from './client'
 import { emptySchema } from './contracts'
 import {
   objectId,
+  agentCapabilitiesSchema,
+  diagnosticProfilesSchema,
+  diagnosticRequestSchema,
+  diagnosticBatchSchema,
+  alertRulesSchema,
+  alertRuleSchema,
+  alertsPageSchema,
+  alertEventsSchema,
+  type DiagnosticRequest,
+  type AlertRule,
   agentsPageSchema,
   tasksPageSchema,
   auditPageSchema,
@@ -31,6 +41,34 @@ function listPath(resource: string, filters: ListFilters) {
 }
 const id = (value: string) => objectId.parse(value)
 export const management = {
+  capabilities: (nodeId: string, signal?: AbortSignal) =>
+    request(`${root}/agents/${id(nodeId)}/capabilities`, agentCapabilitiesSchema, { signal }),
+  tags: (nodeId: string, tags: string[], csrf: string) =>
+    request(`${root}/agents/${id(nodeId)}/tags`, emptySchema, { body: { tags }, csrf }),
+  revoke: (nodeId: string, csrf: string) =>
+    request(`${root}/agents/${id(nodeId)}/revoke`, emptySchema, {
+      body: { confirm_node_id: nodeId },
+      csrf,
+    }),
+  profiles: (signal?: AbortSignal) =>
+    request(`${root}/diagnostic-profiles`, diagnosticProfilesSchema, { signal }),
+  diagnose: (body: DiagnosticRequest, csrf: string) =>
+    request(`${root}/diagnostics`, diagnosticBatchSchema, {
+      body: diagnosticRequestSchema.parse(body),
+      csrf,
+    }),
+  diagnosticBatch: (batchId: string, signal?: AbortSignal) =>
+    request(`${root}/diagnostics/${id(batchId)}`, diagnosticBatchSchema, { signal }),
+  cancelTask: (taskId: string, csrf: string) =>
+    request(`${root}/tasks/${id(taskId)}/cancel`, emptySchema, { body: {}, csrf }),
+  alertRules: (signal?: AbortSignal) =>
+    request(`${root}/alert-rules`, alertRulesSchema, { signal }),
+  putAlertRule: (body: AlertRule, csrf: string) =>
+    request(`${root}/alert-rules`, emptySchema, { body: alertRuleSchema.parse(body), csrf }),
+  alerts: (filters: ListFilters, signal?: AbortSignal) =>
+    request(listPath('alerts', filters), alertsPageSchema, { signal }),
+  alertEvents: (filters: ListFilters, signal?: AbortSignal) =>
+    request(listPath('alert-events', filters), alertEventsSchema, { signal }),
   installer: (signal?: AbortSignal) =>
     request(`${root}/installer`, installerStatusSchema, { signal }),
   install: (ttl_seconds: number, csrf: string) =>

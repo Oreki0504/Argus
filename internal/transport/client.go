@@ -43,7 +43,7 @@ func (e *APIError) ResultRejection() bool {
 }
 func knownErrorCode(s string) bool {
 	switch s {
-	case "invalid_request", "unauthorized", "forbidden", "not_found", "state_conflict", "operation_failed", "server_busy", "result_conflict", "task_rejected", "task_not_found", "result_invalid", "renewal_key_mismatch", "protocol_incompatible":
+	case "invalid_request", "unauthorized", "forbidden", "not_found", "state_conflict", "operation_failed", "server_busy", "result_conflict", "task_rejected", "task_not_found", "result_invalid", "renewal_key_mismatch", "protocol_incompatible", "telemetry_invalid", "telemetry_conflict":
 		return true
 	}
 	return false
@@ -56,6 +56,12 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("server returned HTTP %d (unclassified response)", e.Status)
 }
 func Request(ctx context.Context, c *http.Client, base, token, method, path string, input any) ([]byte, error) {
+	return RequestWithHeaders(ctx, c, base, token, method, path, input, nil)
+}
+
+// RequestWithHeaders exposes authenticated response capabilities after checking
+// the protocol version. Existing callers retain the ordinary Request contract.
+func RequestWithHeaders(ctx context.Context, c *http.Client, base, token, method, path string, input any, responseHeaders func(http.Header)) ([]byte, error) {
 	if e := ValidateURL(base); e != nil {
 		return nil, e
 	}
@@ -77,6 +83,15 @@ func Request(ctx context.Context, c *http.Client, base, token, method, path stri
 		r.Header.Set(protocol.VersionHeader, strconv.Itoa(protocol.Version))
 		r.Header.Set(protocol.AgentVersionHeader, protocol.BuildVersion())
 	}
+	if method == http.MethodPost {
+		switch path {
+		case "/v1/agent/results", "/v1/agent/telemetry", "/v1/agent/heartbeat", "/v1/agent/capabilities":
+			// These operations are explicitly idempotent. The empty marker lets
+			// net/http replay an identical body after a stale reused connection
+			// fails; an empty value slice is deliberately not sent on the wire.
+			r.Header["Idempotency-Key"] = []string{}
+		}
+	}
 	if token != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -87,6 +102,9 @@ func Request(ctx context.Context, c *http.Client, base, token, method, path stri
 	defer res.Body.Close()
 	if agentRequest && (len(res.Header.Values(protocol.VersionHeader)) != 1 || res.Header.Get(protocol.VersionHeader) != strconv.Itoa(protocol.Version)) {
 		return nil, errors.New("incompatible server protocol; local state retained")
+	}
+	if responseHeaders != nil {
+		responseHeaders(res.Header.Clone())
 	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		failure := &APIError{Status: res.StatusCode}

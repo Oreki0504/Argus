@@ -1059,7 +1059,7 @@
     flex-direction: column;
     justify-content: center;
     padding: 64px;
-    background: #fafcfd;
+    background: var(--canvas);
   }
   .auth-card {
     width: 100%;
@@ -1651,5 +1651,138 @@
       transition: none !important;
       scroll-behavior: auto !important;
     }
+  }
+}
+
+@layer refinement {
+  .node-status-dimensions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+  }
+  .node-status-dimension {
+    display: grid;
+    gap: 0.15rem;
+  }
+  .node-status-dimension > small {
+    color: var(--muted);
+    font-size: 0.7rem;
+  }
+  .node-status-dimension .status {
+    font-size: 0.7rem;
+  }
+  .agent-badges .node-status-dimensions {
+    justify-content: flex-end;
+  }
+  .fleet-health-counts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    margin: 1rem 0;
+  }
+  .fleet-health-counts > span {
+    display: inline-flex;
+    gap: 0.4rem;
+    align-items: center;
+  }
+  .history-evidence {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin: 0.5rem 0 1rem;
+  }
+  .status-healthy,
+  .status-fresh,
+  .status-active {
+    color: #16634b;
+    background: #e6f4ed;
+  }
+  .status-warning,
+  .status-stale {
+    color: #815700;
+    background: #fff4da;
+  }
+  .status-critical,
+  .status-revoked {
+    color: #a1262b;
+    background: #fdebed;
+  }
+  .status-unknown,
+  .status-missing,
+  .status-disabled {
+    color: var(--muted);
+    background: var(--canvas);
+  }
+  @media (max-width: 800px) {
+    .agent-card-header {
+      flex-wrap: wrap;
+    }
+    .agent-badges {
+      width: 100%;
+    }
+    .agent-badges .node-status-dimensions {
+      justify-content: flex-start;
+    }
+    .detail-titlebar .node-status-dimensions {
+      width: 100%;
+    }
+  }
+}
+
+@layer refinement {
+  .diagnostic-profile-action {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 1rem;
+    margin: 1rem 0;
+  }
+  .diagnostic-node-options {
+    display: grid;
+    max-height: 18rem;
+    overflow: auto;
+    gap: 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+  }
+  .diagnostic-node-options label {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .diagnostic-node-options input[type='checkbox'] {
+    width: auto;
+  }
+  .result-evidence {
+    display: grid;
+    gap: 0.5rem;
+    margin: 1rem 0;
+  }
+  .result-evidence > div {
+    display: flex;
+    gap: 1rem;
+    justify-content: space-between;
+  }
+  .result-evidence dt {
+    color: var(--muted);
+  }
+  .result-evidence dd {
+    overflow-wrap: anywhere;
+  }
+  .node-diagnostics {
+    padding: 1.5rem;
+    margin-top: 1rem;
+  }
+  .node-diagnostics .management-actions {
+    margin: 1rem 0;
+  }
+}
+
+@layer refinement {
+  .node-tags {
+    display: block;
+    color: var(--muted);
+    font-size: 0.7rem;
   }
 }

@@ -21,10 +21,10 @@ test('anonymous overview uses five-column cards, login action and keyboard detai
   await filters.getByRole('button', { name: 'Online 3', exact: true }).click()
   await expect(page.locator('.agent-card')).toHaveCount(3)
   await expect(page).toHaveURL(/status=Online/)
-  await filters.getByRole('button', { name: 'Stale 1', exact: true }).click()
+  await filters.getByRole('button', { name: 'Stale telemetry 2', exact: true }).click()
   await expect(page.getByRole('article', { name: 'Build runner · 01', exact: true })).toBeVisible()
-  await expect(page.locator('.agent-card')).toHaveCount(1)
-  await filters.getByRole('button', { name: 'Offline 2', exact: true }).click()
+  await expect(page.locator('.agent-card')).toHaveCount(2)
+  await filters.getByRole('button', { name: 'Offline 3', exact: true }).click()
   await expect(page.getByRole('article', { name: 'Staging · Atlas', exact: true })).toBeVisible()
   await expect(page.getByRole('article', { name: 'Archive · 01', exact: true })).toBeVisible()
   await expect(filters.getByRole('button', { name: /Never seen/ })).toHaveCount(0)
@@ -63,7 +63,7 @@ test('anonymous overview uses five-column cards, login action and keyboard detai
     'aria-pressed',
     'true',
   )
-  await expect(page.getByText('Sampling interval 900s')).toBeVisible()
+  await expect(page.getByText('Display bucket 900s')).toBeVisible()
   await page.getByRole('button', { name: 'View sample data' }).click()
   await expect(page.getByRole('region', { name: 'Utilization samples' })).toBeVisible()
   expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([])
@@ -356,7 +356,7 @@ test('production anonymous browsing only requests public projections and never i
     const path = new URL(route.request().url()).pathname
     if (path === '/v1/me') return route.fulfill({ status: 401, json: { code: 'session_expired' } })
     if (path === '/v1/console/public/summary') return route.fulfill({ json: fleetFixture() })
-    if (path === '/v1/console/public/nodes/srv-0001/history')
+    if (path === '/v1/console/public/nodes/srv-0001/telemetry')
       return route.fulfill({ status: 503, json: { code: 'service_unavailable' } })
     protectedRequests.push(path)
     return route.fulfill({ status: 403, json: { code: 'forbidden' } })
@@ -376,8 +376,12 @@ test('production anonymous browsing only requests public projections and never i
 test('missing capacity and missing samples do not become zero utilization', async ({ page }) => {
   await page.goto('/')
   const unknownCapacity = page.getByRole('article', { name: 'Build runner · 01', exact: true })
-  await expect(unknownCapacity.getByRole('meter')).toHaveCount(3)
-  await expect(unknownCapacity.getByText('640K/s', { exact: true })).toBeVisible()
+  await expect(unknownCapacity.getByRole('meter')).toHaveCount(0)
+  await page.getByRole('link', { name: 'View Build runner · 01' }).click()
+  await expect(
+    page.getByRole('slider', { name: 'Inspect Inbound throughput sample' }),
+  ).toBeVisible()
+  await page.getByRole('link', { name: 'All agents', exact: true }).click()
   await page.getByRole('link', { name: 'View Archive · 01' }).click()
   await expect(page.getByText('No measured utilization', { exact: true })).toHaveCount(5)
   await expect(page.locator('.chart-line')).toHaveCount(0)

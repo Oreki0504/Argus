@@ -218,7 +218,7 @@ export const api = {
   history: async (id: string, range: HistoryRange, anonymous: boolean, signal?: AbortSignal) => {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) throw new ApiError(404, 'console_unavailable')
     const data = await request(
-      `/v1/console/${anonymous ? 'public/' : ''}nodes/${id}/history?range=${range}`,
+      `/v1/console/${anonymous ? 'public/' : ''}nodes/${id}/telemetry?range=${range}`,
       nodeHistorySchema,
       { signal },
     )

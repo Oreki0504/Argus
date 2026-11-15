@@ -45,7 +45,10 @@ func (s *Store) DeleteConsoleNode(ctx context.Context, actor, id string) error {
 		if count != 1 {
 			return ErrNotFound
 		}
-		for _, table := range []string{"results", "tasks", "enrollment_tokens", "console_nodes"} {
+		if err := closeNodeAlerts(ctx, tx, id, s.now().Unix(), "node_removed"); err != nil {
+			return err
+		}
+		for _, table := range []string{"telemetry_samples", "results", "tasks", "enrollment_tokens", "console_nodes"} {
 			if _, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE node_id=?", id); err != nil {
 				return err
 			}

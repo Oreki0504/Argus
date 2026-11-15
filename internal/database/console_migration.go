@@ -10,7 +10,7 @@ import (
 	"github.com/Oreki0504/Argus-C2/internal/localdb"
 )
 
-// Explicit, additive migrations. Older binaries reject version 104; the Agent
+// Explicit, additive migrations. Older binaries reject version 105; the Agent
 // schema and protocol are unchanged. No server startup silently upgrades state.
 const consoleSchema = `
 ALTER TABLE audit_events ADD COLUMN subject_id TEXT NOT NULL DEFAULT '';
@@ -105,14 +105,14 @@ func MigrateConsole(ctx context.Context, dir, backup string) error {
 	if version != originalVersion {
 		return errors.New("database changed during migration")
 	}
-	migration := consoleAccountSchema
+	migration := consoleAccountSchema + telemetrySchema
 	if version == 102 {
 		migration = consoleSchema + migration
 	}
 	if _, err = tx.ExecContext(ctx, migration); err != nil {
 		return err
 	}
-	if err = auditSubject(ctx, tx, "local", "console.migrate", "", "", "", "104"); err != nil {
+	if err = auditSubject(ctx, tx, "local", "console.migrate", "", "", "", "105"); err != nil {
 		return err
 	}
 	return tx.Commit()

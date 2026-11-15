@@ -26,7 +26,7 @@ func PrivateFile(path string) error {
 // Existing callers fail if the directory or database is missing. In particular,
 // losing probe replay state must never silently create an empty replacement.
 func Open(dir, name string, create bool) (*sql.DB, error) {
-	if name != "argus.db" && name != "probe.db" {
+	if name != "argus.db" && name != "probe.db" && name != "telemetry.db" {
 		return nil, errors.New("unknown state database")
 	}
 	dir, err := filepath.Abs(dir)

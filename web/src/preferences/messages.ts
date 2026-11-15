@@ -1,9 +1,44 @@
+import { observationChinese } from './observation-messages'
 import { managementChinese } from './management-messages'
 
 export type Language = 'en' | 'zh-CN'
 
 const chinese: Record<string, string> = {
   ...managementChinese,
+  ...observationChinese,
+  'Node status': '节点状态',
+  Connectivity: '连接',
+  Authorization: '授权',
+  Telemetry: '遥测',
+  Health: '健康',
+  Healthy: '健康',
+  Warning: '警告',
+  Critical: '严重',
+  Unknown: '未知',
+  Fresh: '新鲜',
+  Missing: '缺失',
+  Revoked: '已吊销',
+  'Fleet health': '集群健康',
+  'Stale telemetry': '过期遥测',
+  '30 days': '30 天',
+  'Inbound throughput': '接收吞吐量',
+  'Outbound throughput': '发送吞吐量',
+  'Display bucket {seconds}s': '展示时间桶 {seconds} 秒',
+  '{samples} observations · {points} displayed samples. Each bucket shows its latest observation; gaps remain unmeasured.':
+    '共 {samples} 次观测，展示 {points} 个采样点。每个时间桶展示最近一次观测，缺测保留为空。',
+  Received: '接收时间',
+  'Collection errors': '采集错误',
+  'Clock skew': '时钟偏差',
+  'No telemetry has been received. Health remains unknown until valid observations arrive.':
+    '尚未收到遥测。收到有效观测之前，健康状态保持未知。',
+  'The Agent clock is ahead of the server. These observations cannot establish current health.':
+    'Agent 时钟超前于服务器。这些观测无法确认当前健康状态。',
+  '{count} resources reported collection errors. Available measurements are preserved.':
+    '有 {count} 个资源报告采集错误。其余可用测量已保留。',
+  'Waiting for two consecutive network observations from the same Agent boot.':
+    '等待同一 Agent 启动周期内的两次连续网络观测。',
+  'Timestamped telemetry. Throughput is in bits per second. A dash means unmeasured, not zero.':
+    '带时间戳的遥测。吞吐量以每秒比特表示。横线代表缺测，而非零值。',
   'Where the time is': '当前本地时间',
   'Active heartbeat ≤ 90s': '活跃心跳 ≤ 90秒',
   'Filtering stale observations': '正在筛选过期观测',

@@ -1,13 +1,15 @@
 import { useFormat } from '../../lib/useFormat'
 import { Link, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ArrowUpRight } from 'lucide-react'
-import { EmptyState, ErrorState, Loading, Notice, Status } from '../../components/ui'
+import { EmptyState, ErrorState, Loading, Notice } from '../../components/ui'
 import { UtilizationStrip } from '../../components/UtilizationStrip'
-import { heartbeat } from '../../lib/format'
+import { NodeStatuses } from '../../components/NodeStatuses'
+import { observationStatus } from '../../lib/status'
 import { historyRangeSchema } from '../../api/contracts'
 import { useViewer } from '../auth/context'
 import { useNow, useSummary } from '../fleet/useSummary'
 import { NodeHistory } from './NodeHistory'
+import { NodeDiagnostics } from './NodeDiagnostics'
 import { usePreferences } from '../../preferences/context'
 import { canManage } from '../management/access'
 
@@ -36,9 +38,8 @@ export function NodeDetail() {
         {t('This agent is not available.')} <Link to="/">{t('Return to overview')}</Link>
       </EmptyState>
     )
-  const stale =
-    (node.resources.as_of !== null && now - node.resources.as_of > 90) ||
-    (node.traffic.as_of !== null && now - node.traffic.as_of > 90)
+  const status = observationStatus(node, now)
+  const stale = status.telemetry === 'STALE'
 
   const uptimeText =
     node.system.uptime_seconds === null
@@ -56,6 +57,7 @@ export function NodeDetail() {
       value: node.system.kernel ? 'Linux ' + node.system.kernel : t('Unavailable'),
     },
     { label: 'Uptime', value: uptimeText },
+    { label: 'Tags', value: node.tags.join(' · ') || t('None') },
     {
       label: 'Last heartbeat',
       value: relativeTime(node.last_seen_at, now),
@@ -74,7 +76,7 @@ export function NodeDetail() {
           <ArrowLeft size={18} />
         </Link>
         <h1>{node.display_name}</h1>
-        <Status>{heartbeat(node.last_seen_at, now)}</Status>
+        <NodeStatuses node={node} now={now} />
         {canManage(identity, 'tasks:read') &&
           canManage(identity, 'tasks:write') &&
           canManage(identity, 'agents:read') && (
@@ -107,6 +109,10 @@ export function NodeDetail() {
         <div className="node-current-heading">
           <h2>{t('Current utilization')}</h2>
           <span>
+            <span title={timestampLabel(node.telemetry.received_at)}>
+              {t('Received')} {relativeTime(node.telemetry.received_at, now)}
+            </span>
+            {' · '}
             <span title={timestampLabel(node.resources.as_of)}>
               {t('Resources')} {relativeTime(node.resources.as_of, now)}
             </span>{' '}
@@ -119,6 +125,28 @@ export function NodeDetail() {
         <UtilizationStrip node={node} />
       </section>
 
+      {status.telemetry === 'MISSING' && (
+        <Notice>
+          {t(
+            'No telemetry has been received. Health remains unknown until valid observations arrive.',
+          )}
+        </Notice>
+      )}
+      {node.telemetry.clock_skew && (
+        <Notice kind="warning">
+          {t(
+            'The Agent clock is ahead of the server. These observations cannot establish current health.',
+          )}
+        </Notice>
+      )}
+      {node.telemetry.collection_errors > 0 && (
+        <Notice kind="warning">
+          {t(
+            '{count} resources reported collection errors. Available measurements are preserved.',
+            { count: node.telemetry.collection_errors },
+          )}
+        </Notice>
+      )}
       {stale && (
         <Notice kind="warning">
           {t('These observations are stale. The charts retain their original sample times.')}
@@ -128,7 +156,7 @@ export function NodeDetail() {
       <div className="history-heading">
         <h2>{t('Utilization history')}</h2>
         <div className="range-control" role="group" aria-label={t('History time range')}>
-          {(['1h', '24h', '7d'] as const).map((value) => (
+          {(['1h', '24h', '7d', '30d'] as const).map((value) => (
             <button
               key={value}
               type="button"
@@ -145,7 +173,15 @@ export function NodeDetail() {
               }
             >
               <span className="range-dot" aria-hidden="true" />
-              {t(value === '1h' ? '1 hour' : value === '24h' ? '24 hours' : '7 days')}
+              {t(
+                value === '1h'
+                  ? '1 hour'
+                  : value === '24h'
+                    ? '24 hours'
+                    : value === '7d'
+                      ? '7 days'
+                      : '30 days',
+              )}
             </button>
           ))}
         </div>
@@ -176,6 +212,9 @@ export function NodeDetail() {
           </dl>
         </section>
       </NodeHistory>
+      {canManage(identity, 'tasks:read') && canManage(identity, 'agents:read') && (
+        <NodeDiagnostics publicId={node.public_id} />
+      )}
     </section>
   )
 }

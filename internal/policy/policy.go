@@ -13,19 +13,23 @@ import (
 )
 
 type Policy struct {
-	Allowed        []protocol.TaskType    `json:"allowed"`
-	PollSeconds    int                    `json:"poll_seconds"`
-	TimeoutSeconds int                    `json:"timeout_seconds"`
-	MaxResultBytes int                    `json:"max_result_bytes"`
-	Telemetry      collector.Config       `json:"telemetry"`
-	Services       []resources.Service    `json:"services"`
-	SSHProfiles    []resources.SSHProfile `json:"ssh_profiles"`
+	Allowed          []protocol.TaskType    `json:"allowed"`
+	PollSeconds      int                    `json:"poll_seconds"`
+	TimeoutSeconds   int                    `json:"timeout_seconds"`
+	MaxResultBytes   int                    `json:"max_result_bytes"`
+	Telemetry        collector.Config       `json:"telemetry"`
+	TelemetryRuntime *TelemetryRuntime      `json:"telemetry_runtime,omitempty"`
+	Services         []resources.Service    `json:"services"`
+	SSHProfiles      []resources.SSHProfile `json:"ssh_profiles"`
 }
 
 func Default() Policy {
 	return Policy{Allowed: []protocol.TaskType{protocol.SystemInfo, protocol.SystemMetrics}, PollSeconds: 10, TimeoutSeconds: 10, MaxResultBytes: 65536, Telemetry: collector.Config{SampleMilliseconds: 1000, DiskPaths: []string{"/"}, NetworkInterfaces: []string{}}, Services: []resources.Service{}, SSHProfiles: []resources.SSHProfile{}}
 }
 func (p Policy) Validate() error {
+	if err := p.RuntimeTelemetry().Validate(); err != nil {
+		return err
+	}
 	if p.Allowed == nil || len(p.Allowed) > 6 || p.PollSeconds < 5 || p.PollSeconds > 60 || p.TimeoutSeconds < 1 || p.TimeoutSeconds > 30 || p.MaxResultBytes < 1024 || p.MaxResultBytes > protocol.MaxResultBytes || p.Services == nil || p.SSHProfiles == nil || len(p.Services) > 16 || len(p.SSHProfiles) > 4 {
 		return errors.New("invalid local policy limits")
 	}
@@ -60,19 +64,32 @@ func (p Policy) Validate() error {
 }
 func Decode(b []byte) (Policy, error) {
 	var p Policy
-	if e := strictjson.Decode(b, &p, 32768, "allowed", "poll_seconds", "timeout_seconds", "max_result_bytes", "telemetry", "services", "ssh_profiles"); e != nil {
-		return p, e
+	fields := []string{"allowed", "poll_seconds", "timeout_seconds", "max_result_bytes", "telemetry", "services", "ssh_profiles"}
+	// Try the legacy exact shape first; the only allowed extension is the
+	// complete local runtime object. Both paths retain duplicate/null checks.
+	if e := strictjson.Decode(b, &p, 32768, fields...); e != nil {
+		fields = append(fields, "telemetry_runtime")
+		if e = strictjson.Decode(b, &p, 32768, fields...); e != nil {
+			return p, e
+		}
 	}
 	var nested struct {
 		Telemetry json.RawMessage   `json:"telemetry"`
 		Services  []json.RawMessage `json:"services"`
 		Profiles  []json.RawMessage `json:"ssh_profiles"`
+		Runtime   json.RawMessage   `json:"telemetry_runtime"`
 	}
 	if err := json.Unmarshal(b, &nested); err != nil {
 		return p, err
 	}
 	if _, err := collector.DecodeConfig(nested.Telemetry); err != nil {
 		return p, err
+	}
+	if nested.Runtime != nil {
+		var settings TelemetryRuntime
+		if err := strictjson.Decode(nested.Runtime, &settings, 1024, "enabled", "interval_seconds", "buffer_max_bytes"); err != nil {
+			return p, err
+		}
 	}
 	for _, v := range nested.Services {
 		if _, err := resources.DecodeService(v); err != nil {

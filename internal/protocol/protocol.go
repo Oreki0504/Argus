@@ -62,22 +62,25 @@ type TaskRequest struct {
 	ExecutionTimeoutMS int             `json:"execution_timeout_ms"`
 }
 type Result struct {
-	TaskID      string          `json:"task_id"`
-	NodeID      string          `json:"node_id"`
-	Status      TaskStatus      `json:"status"`
-	Payload     json.RawMessage `json:"payload"`
-	Error       string          `json:"error"`
-	CompletedAt int64           `json:"completed_at"`
+	TaskID      string                `json:"task_id"`
+	NodeID      string                `json:"node_id"`
+	Status      TaskStatus            `json:"status"`
+	Payload     json.RawMessage       `json:"payload"`
+	Error       string                `json:"error"`
+	CompletedAt int64                 `json:"completed_at"`
+	Collection  *DiagnosticCollection `json:"collection,omitempty"`
 }
 type Node struct {
 	AgentMetadata
-	ID                     string `json:"id"`
-	Hostname               string `json:"hostname"`
-	CertificateFingerprint string `json:"certificate_fingerprint"`
-	Status                 string `json:"status"`
-	LastSeenAt             int64  `json:"last_seen_at"`
-	CreatedAt              int64  `json:"created_at"`
-	CertificateExpiresAt   int64  `json:"certificate_expires_at"`
+	ID                     string   `json:"id"`
+	Hostname               string   `json:"hostname"`
+	CertificateFingerprint string   `json:"certificate_fingerprint"`
+	Status                 string   `json:"status"`
+	Authorization          string   `json:"authorization"`
+	Tags                   []string `json:"tags"`
+	LastSeenAt             int64    `json:"last_seen_at"`
+	CreatedAt              int64    `json:"created_at"`
+	CertificateExpiresAt   int64    `json:"certificate_expires_at"`
 }
 type EnrollmentRequest struct {
 	Token    string `json:"token"`
@@ -168,6 +171,11 @@ func (r Result) Validate() error {
 	if !identity.Valid(r.TaskID) || !identity.Valid(r.NodeID) || !Terminal(r.Status) || !CleanText(r.Error, 128) || r.CompletedAt <= 0 || len(r.Payload) > MaxResultBytes-1024 {
 		return errors.New("invalid result")
 	}
+	if r.Collection != nil {
+		if err := r.Collection.Validate(r.CompletedAt); err != nil {
+			return err
+		}
+	}
 	var fields map[string]json.RawMessage
 	if json.Unmarshal(r.Payload, &fields) != nil || fields == nil {
 		return errors.New("result payload must be an object")
@@ -186,14 +194,56 @@ func (r Result) Validate() error {
 }
 func DecodeResult(b []byte) (Result, error) {
 	var r Result
-	if err := strictjson.Decode(b, &r, MaxResultBytes, "task_id", "node_id", "status", "payload", "error", "completed_at"); err != nil {
-		return r, err
+	fields := []string{"task_id", "node_id", "status", "payload", "error", "completed_at"}
+	if err := strictjson.Decode(b, &r, MaxResultBytes, fields...); err != nil {
+		if err = strictjson.Decode(b, &r, MaxResultBytes, append(fields, "collection")...); err != nil {
+			return r, err
+		}
+		var raw struct {
+			Collection json.RawMessage `json:"collection"`
+		}
+		if err = json.Unmarshal(b, &raw); err != nil {
+			return r, err
+		}
+		if r.Collection, err = decodeDiagnosticCollection(raw.Collection); err != nil {
+			return r, err
+		}
 	}
 	return r, r.Validate()
 }
 func (r Result) CheckAssignment(t Task) error {
 	if r.TaskID != t.ID || r.NodeID != t.NodeID {
 		return errors.New("result assignment mismatch")
+	}
+	if r.Collection != nil {
+		evidence, err := DiagnosticEvidenceFor(t, r)
+		if err != nil {
+			return err
+		}
+		if evidence != r.Collection.DiagnosticEvidence {
+			return errors.New("collection evidence differs from payload")
+		}
+		if associations := r.Collection.ListenerProcesses; associations != nil {
+			if t.Type != NetworkListeners || r.Status != Succeeded {
+				return errors.New("listener association belongs to a successful listener report")
+			}
+			var listeners Listeners
+			if err := json.Unmarshal(r.Payload, &listeners); err != nil {
+				return err
+			}
+			for _, item := range associations.Items {
+				found := false
+				for _, listener := range listeners.Items {
+					if item.Protocol == listener.Protocol && item.Address == listener.Address && item.Port == listener.Port {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return errors.New("listener association has no observed endpoint")
+				}
+			}
+		}
 	}
 	if r.Status != Succeeded {
 		return nil

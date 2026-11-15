@@ -27,6 +27,11 @@ type Server struct {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	s.diagnosticRoutes(mux)
+	s.telemetryRoutes(mux)
+	s.alertRoutes(mux)
+	s.nodeMetadataRoutes(mux)
+	s.capabilityRoutes(mux)
 	mux.HandleFunc("POST /v1/enroll", func(w http.ResponseWriter, r *http.Request) {
 		metadata, ok := agentMetadata(w, r)
 		if !ok {
@@ -161,7 +166,9 @@ func (s *Server) Handler() http.Handler {
 	slots := make(chan struct{}, 64)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set(protocol.CapabilitiesHeader, "1")
 		w.Header().Set(protocol.VersionHeader, strconv.Itoa(protocol.Version))
+		w.Header().Set(protocol.DiagnosticMetadataHeader, "1")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		if r.TLS == nil {
 			problem(w, 400, "HTTPS required")
@@ -244,6 +251,16 @@ func problemCode(w http.ResponseWriter, status int, code, message string) {
 func reply(w http.ResponseWriter, v any, e error) {
 	if e != nil {
 		switch {
+		case errors.Is(e, database.ErrInvalidCapabilities):
+			problem(w, 400, "invalid capability report")
+		case errors.Is(e, database.ErrInvalidNodeTags):
+			problem(w, 400, "invalid node tags")
+		case errors.Is(e, database.ErrInvalidAlert):
+			problem(w, 400, "invalid alert rule or query")
+		case errors.Is(e, database.ErrTelemetryConflict):
+			problemCode(w, 409, "telemetry_conflict", "sample ID refers to another observation")
+		case errors.Is(e, database.ErrInvalidTelemetry):
+			problemCode(w, 400, "telemetry_invalid", "invalid telemetry sample or observation time")
 		case errors.Is(e, database.ErrResultConflict):
 			problemCode(w, 409, "result_conflict", "result differs from stored outcome")
 		case errors.Is(e, database.ErrTaskRejected):

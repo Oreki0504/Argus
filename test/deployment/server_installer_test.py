@@ -252,6 +252,7 @@ class InstallerTests(unittest.TestCase):
         database = state / ('argus.db' if component == 'server' else 'probe.db')
         with contextlib.closing(sqlite3.connect(database)) as db:
             db.executescript('CREATE TABLE preserved(value TEXT); INSERT INTO preserved VALUES("identity"); '
+                             'CREATE TABLE executions(id TEXT PRIMARY KEY, result TEXT NOT NULL); '
                              f'PRAGMA application_id={0x41524753 if component == "server" else 0x41524741}; '
                              f'PRAGMA user_version={103 if component == "server" else 101};')
         database.chmod(0o600)
@@ -298,31 +299,69 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(target.stat().st_mode) & 0o077, 0)
         self.assertIn(['systemctl', 'start', plan['unit']], calls)
 
-    def test_failed_update_restores_old_program_without_rewinding_database(self):
+    def test_failed_agent_after_start_keeps_new_program_and_committed_state(self):
         args, plan, bundle, system, calls = self.update_fixture()
+        certificate = plan['state'] / 'agent.pem'
+        installer.write_new(certificate, b'original-identity')
+        result = json.dumps({'task_id': 'new-result', 'collection': {'collection_id': 'new-evidence'}})
         def fail_health(_plan):
             with contextlib.closing(sqlite3.connect(plan['state'] / 'probe.db')) as db:
                 db.execute('INSERT INTO preserved VALUES("newly committed result")')
+                db.execute('INSERT INTO executions VALUES(?,?)', ('new-result', result))
                 db.commit()
+            installer.write_new(plan['state'] / 'telemetry.db', b'new-buffered-samples')
             raise installer.InstallError('simulated health failure')
         with patch.object(installer, 'run', side_effect=system), patch.object(installer, 'validate_update'), \
-                patch.object(installer, 'verify_updated_service', side_effect=[installer.InstallError('not ready'), None]), \
-                contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(installer.InstallError, 'previous programs'):
-            # Commit a new record just after replacement and before failure.
-            actual_replace = installer.replace_file
-            def replace(dest, data, mode):
-                actual_replace(dest, data, mode)
-                if dest == plan['files'][0][1] and data == b'new-program':
-                    try:
-                        fail_health(plan)
-                    except installer.InstallError:
-                        pass
-            with patch.object(installer, 'replace_file', side_effect=replace):
-                installer.update_component(args, plan, bundle)
-        self.assertEqual(plan['files'][0][1].read_bytes(), b'old-program')
+                patch.object(installer, 'verify_updated_service', side_effect=fail_health), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(installer.InstallError, 'manual recovery'):
+            installer.update_component(args, plan, bundle)
+        self.assertEqual(plan['files'][0][1].read_bytes(), b'new-program')
         with contextlib.closing(sqlite3.connect(plan['state'] / 'probe.db')) as db:
             self.assertEqual(db.execute('SELECT count(*) FROM preserved').fetchone()[0], 2)
-        self.assertEqual(calls.count(['systemctl', 'start', plan['unit']]), 2)
+            self.assertEqual(db.execute('SELECT result FROM executions').fetchone()[0], result)
+        self.assertEqual(certificate.read_bytes(), b'original-identity')
+        self.assertEqual((plan['state'] / 'telemetry.db').read_bytes(), b'new-buffered-samples')
+        backup = next(installer.path('/var/lib/argus-c2-updates').iterdir())
+        record = json.loads((backup / 'update.json').read_text())
+        self.assertEqual(record['phase'], 'agent_needs_recovery')
+        self.assertTrue(record['candidate_started'])
+        self.assertEqual((backup / 'state/agent.pem').read_bytes(), b'original-identity')
+        self.assertEqual(calls.count(['systemctl', 'start', plan['unit']]), 1)
+        self.assertEqual(calls[-1], ['systemctl', 'stop', plan['unit']])
+
+    def test_failed_agent_before_start_restores_previous_program(self):
+        args, plan, bundle, system, calls = self.update_fixture()
+        before = (plan['state'] / 'probe.db').read_bytes()
+        actual_replace = installer.replace_file
+        def replace(dest, data, mode):
+            actual_replace(dest, data, mode)
+            if dest == plan['files'][0][1] and data == b'new-program':
+                raise installer.InstallError('simulated program replacement failure')
+        with patch.object(installer, 'run', side_effect=system), patch.object(installer, 'validate_update'), \
+                patch.object(installer, 'verify_updated_service') as verify, \
+                patch.object(installer, 'replace_file', side_effect=replace), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(installer.InstallError, 'previous programs'):
+            installer.update_component(args, plan, bundle)
+        self.assertEqual(plan['files'][0][1].read_bytes(), b'old-program')
+        self.assertEqual((plan['state'] / 'probe.db').read_bytes(), before)
+        verify.assert_called_once_with(plan)
+        self.assertEqual(calls.count(['systemctl', 'start', plan['unit']]), 1)
+
+    def test_failed_agent_start_command_does_not_assume_no_state_was_written(self):
+        args, plan, bundle, system, calls = self.update_fixture()
+        def fail_start(command, **kwargs):
+            result = system(command, **kwargs)
+            if command[:2] == ['systemctl', 'start']:
+                raise installer.InstallError('simulated startup timeout after process launch')
+            return result
+        with patch.object(installer, 'run', side_effect=fail_start), patch.object(installer, 'validate_update'), \
+                patch.object(installer, 'verify_updated_service') as verify, \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(installer.InstallError, 'manual recovery'):
+            installer.update_component(args, plan, bundle)
+        self.assertEqual(plan['files'][0][1].read_bytes(), b'new-program')
+        verify.assert_not_called()
+        self.assertEqual(calls.count(['systemctl', 'start', plan['unit']]), 1)
+        self.assertEqual(calls[-1], ['systemctl', 'stop', plan['unit']])
 
     def test_update_rejects_incompatible_candidate_before_replacing_program(self):
         args, plan, bundle, system, calls = self.update_fixture()
@@ -411,6 +450,102 @@ class InstallerTests(unittest.TestCase):
         (plan['state'] / 'probe.db').write_bytes(b'corrupt database')
         with self.assertRaises(sqlite3.DatabaseError):
             installer.database_stamp(plan['state'], 'agent')
+
+    def agent_compatibility_fixture(self, *, modern=False, telemetry=False, collection=False):
+        _, plan, bundle, _, _ = self.update_fixture()
+        installer.mkdir(installer.path('/var/tmp'))
+        if telemetry:
+            installer.write_new(plan['state'] / 'telemetry.db', b'retained-observations')
+        result = {'task_id': 'persisted-result', 'node_id': 'original-node', 'status': 'SUCCEEDED',
+                  'payload': {}, 'error': '', 'completed_at': 1}
+        if collection:
+            result['collection'] = {'collection_id': 'retained-evidence'}
+        with contextlib.closing(sqlite3.connect(plan['state'] / 'probe.db')) as db:
+            db.execute('INSERT INTO executions VALUES(?,?)', ('persisted-result', json.dumps(result)))
+            db.commit()
+        storage = {'storage': {}, 'results': {}}
+        if modern:
+            storage.update(telemetry={}, telemetry_storage={})
+        # Real subprocess fixture models the legacy strict Result decoder.
+        # Only the runuser wrapper is removed; all config/state/export paths are
+        # the installer-created validation copy, never the retained deployment.
+        candidate = bundle / 'agent-linux-amd64'
+        candidate.write_text('''#!/usr/bin/env python3
+import json, os, sqlite3, sys
+from pathlib import Path
+args = sys.argv[1:]
+config = json.loads(Path(args[args.index('-config') + 1]).read_text())
+if args[0] == 'storage':
+    print(STORAGE)
+elif args[0] == 'result-export':
+    with sqlite3.connect(Path(config['state_dir']) / 'probe.db') as db:
+        raw = db.execute('SELECT result FROM executions WHERE id=?', (args[args.index('-task') + 1],)).fetchone()[0]
+    if not MODERN and set(json.loads(raw)) != {'task_id', 'node_id', 'status', 'payload', 'error', 'completed_at'}:
+        sys.exit(7)
+    with os.fdopen(os.open(args[args.index('-out') + 1], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as out:
+        out.write(raw + '\\n')
+elif args[0] != 'run':
+    sys.exit(9)
+'''.replace('STORAGE', repr(json.dumps(storage))).replace('MODERN', repr(modern)))
+        calls, exports = [], []
+        actual_run = installer.run
+        def execute(command, **kwargs):
+            calls.append(command)
+            self.assertEqual(command[:4], ['runuser', '-u', plan['account'].pw_name, '--'])
+            checked = json.loads(Path(command[command.index('-config') + 1]).read_text())
+            self.assertNotEqual(checked['state_dir'], str(plan['state']))
+            outcome = actual_run(command[4:], **kwargs)
+            if 'result-export' in command:
+                output = Path(command[command.index('-out') + 1])
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+                exports.append(json.loads(output.read_text()))
+            return outcome
+        return plan, bundle, execute, calls, exports, result
+
+    def test_legacy_agent_restore_still_accepts_legacy_retained_data(self):
+        plan, bundle, execute, calls, exports, _ = self.agent_compatibility_fixture()
+        before = (plan['state'] / 'probe.db').read_bytes()
+        with patch.object(installer, 'run', side_effect=execute), patch.object(installer, 'architecture', return_value='amd64'):
+            installer.validate_update(plan, bundle, plan['state'], allow_migration=False)
+        self.assertEqual((plan['state'] / 'probe.db').read_bytes(), before)
+        self.assertEqual(plan['files'][0][1].read_bytes(), b'old-program')
+        self.assertFalse(exports)
+        self.assertTrue(any('run' in call for call in calls))
+
+    def test_legacy_agent_update_and_restore_reject_retained_telemetry(self):
+        plan, bundle, execute, _, _, _ = self.agent_compatibility_fixture(telemetry=True)
+        before = (plan['state'] / 'probe.db').read_bytes()
+        for migration in (True, False):
+            with self.subTest(allow_migration=migration), patch.object(installer, 'run', side_effect=execute), \
+                    patch.object(installer, 'architecture', return_value='amd64'), \
+                    self.assertRaisesRegex(installer.InstallError, 'retained telemetry storage'):
+                installer.validate_update(plan, bundle, plan['state'], allow_migration=migration)
+        self.assertEqual((plan['state'] / 'probe.db').read_bytes(), before)
+        self.assertEqual((plan['state'] / 'telemetry.db').read_bytes(), b'retained-observations')
+        self.assertEqual(plan['files'][0][1].read_bytes(), b'old-program')
+
+    def test_legacy_agent_restore_rejects_new_result_envelope_without_telemetry(self):
+        plan, bundle, execute, calls, exports, _ = self.agent_compatibility_fixture(collection=True)
+        before = (plan['state'] / 'probe.db').read_bytes()
+        with patch.object(installer, 'run', side_effect=execute), patch.object(installer, 'architecture', return_value='amd64'), \
+                self.assertRaises(installer.CommandError) as raised:
+            installer.validate_update(plan, bundle, plan['state'], allow_migration=False)
+        self.assertEqual(raised.exception.returncode, 7)
+        self.assertEqual(plan['stage'], 'checking_agent_data_compatibility')
+        self.assertTrue(any('result-export' in call for call in calls))
+        self.assertFalse(exports)
+        self.assertEqual((plan['state'] / 'probe.db').read_bytes(), before)
+        self.assertEqual(plan['files'][0][1].read_bytes(), b'old-program')
+
+    def test_compatible_agent_restore_checks_collection_and_telemetry_on_copy(self):
+        plan, bundle, execute, _, exports, result = self.agent_compatibility_fixture(modern=True, telemetry=True, collection=True)
+        before = (plan['state'] / 'probe.db').read_bytes()
+        with patch.object(installer, 'run', side_effect=execute), patch.object(installer, 'architecture', return_value='amd64'):
+            installer.validate_update(plan, bundle, plan['state'], allow_migration=False)
+        self.assertEqual(exports, [result])
+        self.assertEqual((plan['state'] / 'probe.db').read_bytes(), before)
+        self.assertEqual((plan['state'] / 'telemetry.db').read_bytes(), b'retained-observations')
+        self.assertEqual(list(installer.path('/var/tmp').iterdir()), [])
 
     def test_identifiers_ports_and_certificate_options_are_validated(self):
         for host in ('0.0.0.0', '::', 'bad;cmd', 'bad%host', 'foo\nbar', '-x.example', 'https://x.example', 'a..b', '224.0.0.1'):
@@ -889,7 +1024,10 @@ class InstallerTests(unittest.TestCase):
         # upgrade with real Go migration and token issuance, isolated system ops.
         installer.mkdir(installer.path('/var/tmp'))
         with contextlib.closing(sqlite3.connect(state)) as db:
-            db.executescript('DROP TABLE console_identities; DROP TABLE console_token; PRAGMA user_version=103;')
+            db.executescript('DROP TABLE IF EXISTS diagnostic_result_metadata; DROP TABLE IF EXISTS agent_capabilities; DROP TABLE node_tags; DROP TABLE node_revocations; '
+                             'DROP TABLE audit_settings; DROP TABLE diagnostic_batch_tasks; DROP TABLE diagnostic_batches; '
+                             'DROP TABLE alert_events; DROP TABLE alert_states; DROP TABLE alerts; DROP TABLE alert_rules; '
+                             'DROP TABLE telemetry_samples; DROP TABLE console_identities; DROP TABLE console_token; PRAGMA user_version=103;')
         running = [True]
         def updating_run(command, **kwargs):
             command = [str(arg) for arg in command]
@@ -910,7 +1048,7 @@ class InstallerTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as output:
             plan = installer.update_plan('server', installer.architecture())
             installer.update_component(args, plan, bundle)
-        self.assertEqual(installer.database_stamp(state.parent, 'server'), (0x41524753, 104))
+        self.assertEqual(installer.database_stamp(state.parent, 'server'), (0x41524753, 105))
         self.assertIn('https://127.0.0.1/login', output.getvalue())
         self.assertEqual(installer.path('/etc/argus-c2/server.json').read_text(), json.dumps(config, indent=2) + '\n')
         replacement = next(installer.path('/etc/argus-c2/setup').glob('console-*.token'))
@@ -921,6 +1059,41 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT digest FROM console_token').fetchone()[0], hashlib.sha256(token.encode()).hexdigest())
         backup = next(installer.path('/var/lib/argus-c2-updates').iterdir())
         self.assertEqual(installer.database_stamp(backup / 'state', 'server'), (0x41524753, 103))
+
+        # Exercise the separate 104 -> 105 telemetry migration using the real
+        # candidate and an initialized administrator. An unfinished setup
+        # intentionally issues a fresh token during update, so it cannot prove
+        # preservation of an existing administrator's access.
+        with contextlib.closing(sqlite3.connect(state)) as db:
+            db.executescript('DROP TABLE IF EXISTS diagnostic_result_metadata; DROP TABLE agent_capabilities; '
+                             'DROP TABLE node_tags; DROP TABLE node_revocations; DROP TABLE audit_settings; '
+                             'DROP TABLE diagnostic_batch_tasks; DROP TABLE diagnostic_batches; '
+                             'DROP TABLE alert_events; DROP TABLE alert_states; DROP TABLE alerts; DROP TABLE alert_rules; '
+                             'DROP TABLE telemetry_samples; PRAGMA user_version=104;'
+                             "INSERT INTO console_users(id,issuer,subject,name,role,status,created_at,last_login_at) "
+                             "VALUES('upgrade-admin','urn:argus:local','upgrade-admin','Administrator','Admin','active',1,1);"
+                             "INSERT INTO console_identities(issuer,subject,user_id,created_at) "
+                             "VALUES('urn:argus:local','upgrade-admin','upgrade-admin',1);"
+                             "UPDATE console_token SET user_id='upgrade-admin' WHERE id=1;"
+                             'UPDATE console_state SET initialized=1 WHERE id=1;')
+            account_before = {table: db.execute(f'SELECT * FROM {table}').fetchall()
+                              for table in ('console_state', 'console_users', 'console_identities', 'console_token')}
+        token_files_before = set(installer.path('/etc/argus-c2/setup').glob('*.token'))
+        previous_backups = set(installer.path('/var/lib/argus-c2-updates').iterdir())
+        with patch.object(installer, 'run', side_effect=updating_run), patch.object(installer.pwd, 'getpwnam', return_value=account), \
+                patch.object(installer.shutil, 'which', return_value='/usr/bin/tool'), patch.object(installer, 'verify_updated_service'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            plan = installer.update_plan('server', installer.architecture())
+            installer.update_component(args, plan, bundle)
+        self.assertEqual(installer.database_stamp(state.parent, 'server'), (0x41524753, 105))
+        self.assertEqual(set(installer.path('/etc/argus-c2/setup').glob('*.token')), token_files_before)
+        with contextlib.closing(sqlite3.connect(state)) as db:
+            self.assertEqual(db.execute('SELECT digest FROM console_token').fetchone()[0], hashlib.sha256(token.encode()).hexdigest())
+            for table, rows in account_before.items():
+                self.assertEqual(db.execute(f'SELECT * FROM {table}').fetchall(), rows, table)
+            self.assertEqual(db.execute("SELECT count(*) FROM audit_events WHERE action='telemetry.migrate'").fetchone()[0], 1)
+        new_backup = next(iter(set(installer.path('/var/lib/argus-c2-updates').iterdir()) - previous_backups))
+        self.assertEqual(installer.database_stamp(new_backup / 'state', 'server'), (0x41524753, 104))
 
 
 if __name__ == '__main__':

@@ -2,7 +2,7 @@ import { useFormat } from '../../lib/useFormat'
 import { usePreferences } from '../../preferences/context'
 import { useId, useState } from 'react'
 import type { NodeHistory } from '../../api/contracts'
-import { seriesSegments, utilizationSeverity, type MetricKey } from '../../lib/utilization'
+import { seriesSegments, utilizationSeverity, type HistoryMetricKey } from '../../lib/utilization'
 
 export function UtilizationChart({
   history,
@@ -11,18 +11,21 @@ export function UtilizationChart({
   tone,
 }: {
   history: NodeHistory
-  metricKey: MetricKey
+  metricKey: HistoryMetricKey
   title: string
   tone: string
 }) {
-  const { timestampLabel, utilizationLabel } = useFormat()
+  const { timestampLabel, utilizationLabel, quantity } = useFormat()
   const { t, language } = usePreferences()
+  const isRate = metricKey.endsWith('_bps')
+  const valueLabel = (value: number | null) =>
+    isRate ? quantity(value, 'rate') : utilizationLabel(value)
   const id = useId()
   const [inspected, setInspected] = useState<number | null>(null)
   const valid = history.points.filter((point) => point[metricKey] !== null)
   const segments = seriesSegments(history, metricKey)
   const max = Math.max(
-    100,
+    isRate ? 1 : 100,
     Math.ceil(Math.max(0, ...valid.map((point) => point[metricKey]!)) / 25) * 25,
   )
   const x = (time: number) =>
@@ -34,13 +37,15 @@ export function UtilizationChart({
   const mean = valid.length
     ? valid.reduce((sum, point) => sum + point[metricKey]!, 0) / valid.length
     : null
-  const severity = utilizationSeverity(latestValid?.[metricKey] ?? mean)
+  const severity = isRate ? 'unknown' : utilizationSeverity(latestValid?.[metricKey] ?? mean)
 
   const timeLabel = (value: number) =>
     new Intl.DateTimeFormat(language, {
       hour: '2-digit',
       minute: '2-digit',
-      ...(history.range === '7d' ? { month: 'short', day: 'numeric' } : {}),
+      ...(history.range === '7d' || history.range === '30d'
+        ? { month: 'short', day: 'numeric' }
+        : {}),
     }).format(value * 1000)
 
   return (
@@ -60,18 +65,18 @@ export function UtilizationChart({
               <strong>
                 {activePoint[metricKey] === null
                   ? t('Unmeasured')
-                  : utilizationLabel(activePoint[metricKey])}
+                  : valueLabel(activePoint[metricKey])}
               </strong>
             </span>
           ) : (
             <>
               {latestValid && (
                 <span className="chart-latest-badge">
-                  <strong>{utilizationLabel(latestValid[metricKey])}</strong>
+                  <strong>{valueLabel(latestValid[metricKey])}</strong>
                 </span>
               )}
               <span className="chart-avg-label">
-                {t('Average')} <strong>{utilizationLabel(mean)}</strong>
+                {t('Average')} <strong>{valueLabel(mean)}</strong>
               </span>
             </>
           )}
@@ -94,7 +99,7 @@ export function UtilizationChart({
               ? `${timestampLabel(activePoint.timestamp)}: ${
                   activePoint[metricKey] === null
                     ? t('Unmeasured')
-                    : utilizationLabel(activePoint[metricKey])
+                    : valueLabel(activePoint[metricKey])
                 }`
               : t('Unavailable')
           }
@@ -142,7 +147,7 @@ export function UtilizationChart({
           <desc id={`${id}-description`}>
             {t('{count} measured samples. Average {average}. Gaps are unmeasured.', {
               count: valid.length,
-              average: utilizationLabel(mean),
+              average: valueLabel(mean),
             })}
           </desc>
           <defs>
@@ -161,7 +166,7 @@ export function UtilizationChart({
                 y2={y(fraction * max)}
               />
               <text x={26} y={y(fraction * max) + 3} textAnchor="end" className="chart-axis">
-                {fraction * max}%
+                {isRate ? quantity(fraction * max, 'rate') : `${fraction * max}%`}
               </text>
             </g>
           ))}
@@ -227,8 +232,8 @@ export function UtilizationChart({
         <div className="chart-unavailable">
           <span>{t('No measured utilization')}</span>
           <p>
-            {metricKey.endsWith('bound_percent')
-              ? t('Waiting for traffic samples and a configured bandwidth capacity.')
+            {isRate
+              ? t('Waiting for two consecutive network observations from the same Agent boot.')
               : t('This agent has no resource samples in the selected window.')}
           </p>
         </div>

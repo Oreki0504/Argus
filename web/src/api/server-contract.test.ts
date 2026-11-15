@@ -20,6 +20,7 @@ test.skipIf(!filename)('actual Go Console responses satisfy the browser contract
     agents: agentsPageSchema,
     tasks: tasksPageSchema,
     task: taskDetailSchema,
+    listener_task: taskDetailSchema,
     users: usersPageSchema,
     audit: auditPageSchema,
     enrollment: enrollmentSchema,

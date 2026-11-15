@@ -36,6 +36,29 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def legacy_schema_sql(version):
+    """Reconstruct an empty pre-telemetry schema in the disposable fixture."""
+    require(version in (103, 104), 'Unsupported legacy schema fixture.')
+    tables = ['diagnostic_result_metadata', 'agent_capabilities', 'node_tags',
+              'node_revocations', 'audit_settings', 'diagnostic_batch_tasks',
+              'diagnostic_batches', 'alert_events', 'alert_states', 'alerts',
+              'alert_rules', 'telemetry_samples']
+    if version == 103:
+        tables += ['console_token', 'console_identities']
+    return ('PRAGMA foreign_keys=ON; BEGIN; '
+            + ''.join(f'DROP TABLE {table}; ' for table in tables)
+            + f'PRAGMA user_version={version}; COMMIT;')
+
+
+def server_schema(sql=''):
+    """Run fixture SQL with the real service account and return its schema."""
+    return int(run('runuser', '-u', 'argus-server', '--', 'python3', '-c',
+                   'import sqlite3, sys; '
+                   'db=sqlite3.connect("/var/lib/argus-c2-server/argus.db"); '
+                   'db.executescript(sys.argv[1]); '
+                   'print(db.execute("PRAGMA user_version").fetchone()[0]); db.close()', sql))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--disposable-ci', action='store_true', required=True)
@@ -74,15 +97,15 @@ def main():
         require('active' == run('systemctl', 'is-active', unit).strip(), 'Installed Server is not active.')
         require('argus-server' == run('systemctl', 'show', unit, '-p', 'User', '--value').strip(),
                 'Server must run as its dedicated account.')
-        # Exercise schema 103 -> 104 as the actual service user, not root. The
+        # Exercise schema 103 -> 105 as the actual service user, not root. The
         # isolated test's mocked runuser cannot expose ownership regressions.
         run('systemctl', 'stop', unit)
-        run('runuser', '-u', 'argus-server', '--', 'python3', '-c',
-            'import sqlite3; db=sqlite3.connect("/var/lib/argus-c2-server/argus.db"); '
-            'db.executescript("DROP TABLE console_token; DROP TABLE console_identities; PRAGMA user_version=103;"); db.close()')
+        require(server_schema() == 105, 'Fresh installation has an unexpected schema.')
+        require(server_schema(legacy_schema_sql(103)) == 103, 'Could not construct schema 103 fixture.')
         run(sys.executable, installer, '--bundle', bundle, '--update', 'server', '--language', 'en')
         require(run('systemctl', 'show', unit, '-p', 'ActiveState', '--value').strip() == 'inactive',
                 'Migration restarted an intentionally stopped service.')
+        require(server_schema() == 105, 'Schema 103 migration did not reach schema 105.')
         secret_file = max((root / 'setup').glob('console-*.token'), key=lambda p: p.stat().st_mtime_ns)
         secret = secret_file.read_text().strip()
         run('systemctl', 'start', unit)
@@ -138,6 +161,15 @@ def main():
         identity_files = [root / 'server/ca.pem', root / 'server/ca-key.pem', root / 'server/admin.token',
                           root / 'console/browser-key.pem', root / 'server.json', root / 'server-local.json']
         original_identity = {p: p.read_bytes() for p in identity_files}
+        # The immediately previous release has schema 104 and an activated
+        # Console. Its telemetry migration must preserve the owner and token.
+        run('systemctl', 'stop', unit)
+        require(server_schema(legacy_schema_sql(104)) == 104, 'Could not construct schema 104 fixture.')
+        run(sys.executable, installer, '--bundle', bundle, '--update', 'server', '--language', 'en')
+        require(server_schema() == 105, 'Schema 104 migration did not reach schema 105.')
+        require(run('systemctl', 'show', unit, '-p', 'ActiveState', '--value').strip() == 'inactive',
+                'Telemetry migration restarted an intentionally stopped service.')
+        run('systemctl', 'start', unit)
         run(sys.executable, installer, '--bundle', bundle, '--update', 'server', '--language', 'en')
         for p, contents in original_identity.items():
             require(p.read_bytes() == contents, 'Server update replaced existing identity or configuration.')
@@ -165,6 +197,8 @@ def main():
         agent_binary.chmod(0o755)
         shutil.copyfile(root / 'server/ca.pem', root / 'ca.pem')
         shutil.copyfile('examples/policy.json', root / 'policy.json')
+        require('telemetry_runtime' not in json.loads((root / 'policy.json').read_text()),
+                'Upgrade fixture must exercise a legacy policy without telemetry_runtime.')
         (root / 'agent.json').write_text(json.dumps({'server': 'https://127.0.0.1:8443', 'ca': str(root / 'ca.pem'),
                                                    'state_dir': str(agent_state), 'policy': str(root / 'policy.json')}))
         for p in (root / 'ca.pem', root / 'policy.json', root / 'agent.json'):
@@ -186,8 +220,8 @@ def main():
         after_nodes = json.loads(run(*cli, 'nodes'))
         require(len(after_nodes) == 1 and after_nodes[0]['id'] == before_nodes[0]['id'], 'Agent update reenrolled the node.')
         run('systemctl', 'is-active', '--quiet', 'argus-c2-agent.service')
-        # No operator-created tasks: a new Console deployment must populate
-        # the dashboard from the real Agent's local read-only collectors.
+        # A legacy policy must enable independent telemetry at the default
+        # 60-second interval without creating any diagnostic monitoring tasks.
         host_release = platform.freedesktop_os_release()
         require(host_release['ID'] == 'ubuntu', 'Native installation fixture requires an Ubuntu runner.')
         expected_os = f"Ubuntu {host_release['VERSION_ID']}"
@@ -201,9 +235,27 @@ def main():
                         f"Expected {expected_os}, got {nodes[0]['system']['os']!r} in Console system information.")
                 require(nodes[0]['system']['architecture'] == 'amd64', 'Missing Agent architecture.')
                 require(nodes[0]['traffic']['inbound_capacity_bps'] is None, 'Invented link capacity.')
+                require(nodes[0]['status']['connectivity'] == 'ONLINE', 'Agent heartbeat is not online.')
+                require(nodes[0]['status']['authorization'] == 'ACTIVE', 'Agent identity is not active.')
+                require(nodes[0]['status']['telemetry'] == 'FRESH', 'New telemetry is not fresh.')
+                require(nodes[0]['telemetry']['interval_seconds'] == 60, 'Legacy policy lost the default telemetry interval.')
                 break
-            require(time.monotonic() < deadline, 'Automatic metrics and two network samples did not reach Console.')
+            require(time.monotonic() < deadline, 'Independent telemetry and two network samples did not reach Console.')
             time.sleep(2)
+        require(json.loads(run(*cli, 'tasks')) == [], 'Default monitoring created diagnostic tasks.')
+        observations = json.loads(run(*cli, 'telemetry', '-node', after_nodes[0]['id'], '-limit', '100'))['items']
+        require(len(observations) >= 2, 'Telemetry history lacks consecutive observations.')
+        require(all(sample['interval_seconds'] == 60 for sample in observations), 'Unexpected telemetry cadence.')
+        require(any(previous['boot_id'] == current['boot_id'] and
+                    current['observed_at'] > previous['observed_at'] and
+                    any(rate['available'] for rate in current['network_rates'])
+                    for previous, current in zip(observations, observations[1:])),
+                'Network rates lack two valid observations from the same Agent boot.')
+        history = request(f"/v1/console/nodes/{nodes[0]['public_id']}/telemetry?range=1h")
+        require(history['source'] == 'telemetry' and history['sample_count'] >= 2,
+                'Console history did not read independent telemetry.')
+        require(any(point['cpu_percent'] is not None and point['inbound_bps'] is not None
+                    for point in history['points']), 'Console telemetry chart has no measured CPU and network rate.')
         # A valid archive containing a failing candidate must leave old programs
         # and the live service available. Unit tests also cover failures after replacement.
         with tempfile.TemporaryDirectory(prefix='argus-bad-update-') as temporary:
@@ -262,7 +314,7 @@ def main():
         run(sys.executable, installer, '--uninstall', 'server', '--purge', '--yes', '--language', 'en')
         run(sys.executable, installer, '--bundle', bundle, '--host', '127.0.0.1', '--tls', 'local-ca')
         run('systemctl', 'is-active', '--quiet', unit)
-        print('Native installation, schema 103 migration, token login, updates, rollback, component-scoped uninstall, restore and purge/reinstall passed.')
+        print('Native installation, schema 103/104 to 105 migrations, token login, independent telemetry, legacy policy update, rollback, component-scoped uninstall, restore and purge/reinstall passed.')
     finally:
         subprocess.run(['systemctl', 'stop', 'argus-c2-agent.service'], capture_output=True, timeout=60)
         subprocess.run(['systemctl', 'disable', '--now', unit], capture_output=True, timeout=60)

@@ -49,7 +49,21 @@ export function fleetFixture(count = 6, now = Math.floor(Date.now() / 1000)): Su
     return {
       public_id: `srv-${String(index + 1).padStart(4, '0')}`,
       display_name: count <= 6 ? names[i] : `Server · ${String(index + 1).padStart(3, '0')}`,
+      tags: index < 3 ? ['production'] : ['development'],
       last_seen_at: now - [12, 28, 41, 180, 740, 3600][i],
+      status: {
+        connectivity: i < 3 ? 'ONLINE' : 'OFFLINE',
+        authorization: 'ACTIVE',
+        telemetry: !available ? 'MISSING' : stale ? 'STALE' : 'FRESH',
+        health: !available || stale ? 'UNKNOWN' : 'HEALTHY',
+      },
+      telemetry: {
+        observed_at: available ? now - (stale ? 780 : 35) : null,
+        received_at: available ? now - (stale ? 770 : 30) : null,
+        interval_seconds: 60,
+        clock_skew: false,
+        collection_errors: 0,
+      },
       system: {
         os: available ? ['Ubuntu 24.04', 'Debian 13', 'Ubuntu 24.04'][i % 3] : null,
         architecture: available ? 'x86_64' : null,
@@ -89,8 +103,8 @@ export function historyFixture(
   range: HistoryRange,
   now = Math.floor(Date.now() / 1000),
 ): NodeHistory {
-  const duration = { '1h': 3600, '24h': 86400, '7d': 604800 }[range]
-  const interval = { '1h': 60, '24h': 900, '7d': 3600 }[range]
+  const duration = { '1h': 3600, '24h': 86400, '7d': 604800, '30d': 2592000 }[range]
+  const interval = { '1h': 60, '24h': 900, '7d': 3600, '30d': 1800 }[range]
   const start = now - duration
   const variation = Number(node.public_id.slice(-4))
   const lastResource = node.resources.as_of ?? 0
@@ -107,6 +121,19 @@ export function historyFixture(
           const traffic = !gap && timestamp <= lastTraffic
           return {
             timestamp,
+            received_at: timestamp + 5,
+            collection_interval_seconds: 60,
+            collection_errors: 0,
+            clock_skew: false,
+            gap_before: gap,
+            inbound_bps:
+              traffic && node.traffic.inbound_bps !== null
+                ? Math.max(0, node.traffic.inbound_bps * (1 + wave(index) / 100))
+                : null,
+            outbound_bps:
+              traffic && node.traffic.outbound_bps !== null
+                ? Math.max(0, node.traffic.outbound_bps * (1 + wave(index) / 100))
+                : null,
             cpu_percent:
               resources && node.resources.cpu_percent !== null
                 ? clamp(node.resources.cpu_percent + wave(index) * 1.6)
@@ -140,6 +167,9 @@ export function historyFixture(
           }
         })
   return {
+    source: 'telemetry',
+    aggregation: 'latest_per_bucket',
+    sample_count: points.length,
     public_id: node.public_id,
     range,
     window_start: start,

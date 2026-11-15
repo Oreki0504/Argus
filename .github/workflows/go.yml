@@ -16,7 +16,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: false
       - run: go build ./...
       - run: go vet ./...
@@ -42,6 +42,7 @@ jobs:
           go test ./internal/protocol -run '^$' -fuzz '^FuzzDecodeTask$' -fuzztime=10s -parallel=2
           go test ./internal/protocol -run '^$' -fuzz '^FuzzDecodeResult$' -fuzztime=10s -parallel=2
           go test ./internal/protocol -run '^$' -fuzz '^FuzzDecodeMeasurements$' -fuzztime=10s -parallel=2
+          go test ./internal/protocol -run '^$' -fuzz '^FuzzDecodeTelemetryBatch$' -fuzztime=10s -parallel=2
           go test ./internal/enrollment -run '^$' -fuzz '^FuzzParseCSR$' -fuzztime=10s -parallel=2
           go test ./internal/collectors/ssh -run '^$' -fuzz '^FuzzSSHParsers$' -fuzztime=10s -parallel=2
           go test ./internal/collectors/services -run '^$' -fuzz '^FuzzDBusResponseGuard$' -fuzztime=10s -parallel=2
@@ -53,6 +54,12 @@ jobs:
             CGO_ENABLED=0 go build -trimpath -o "bin/$command" "./cmd/$command"
           done
           python3 test/deployment/cli_smoke.py --bin ./bin
+      - name: Fifty-node telemetry workload
+        if: runner.os == 'Linux'
+        env:
+          ARGUS_TELEMETRY_LOAD: '1'
+          ARGUS_TELEMETRY_LOAD_SAMPLES: '1440'
+        run: go test ./test/integration -run '^TestTelemetryFiftyNodeLoad$' -count=1 -v
   deployment:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -62,7 +69,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: '1.27.3'
+          go-version: '1.27.4'
           cache: false
       - name: Build deployment binaries
         run: |

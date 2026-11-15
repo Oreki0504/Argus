@@ -33,7 +33,16 @@ func main() {
 }
 func run() error {
 	if len(os.Args) < 2 {
-		return errors.New("usage: server init|run|backup|storage|prune|certificates|console-migrate|console-bootstrap|console-token [flags]")
+		return errors.New("usage: server init|run|backup|storage|prune|telemetry-prune|telemetry-migrate|audit-retention|audit-export|audit-verify|certificates|console-migrate|console-bootstrap|console-token [flags]")
+	}
+	if os.Args[1] == "audit-retention" || os.Args[1] == "audit-export" || os.Args[1] == "audit-verify" {
+		return auditCommand(os.Args[1], os.Args[2:], os.Stdout)
+	}
+	if os.Args[1] == "telemetry-migrate" {
+		return telemetryMigrateCommand(os.Args[2:], os.Stdout)
+	}
+	if os.Args[1] == "telemetry-prune" {
+		return telemetryPruneCommand(os.Args[2:], os.Stdout)
 	}
 	if os.Args[1] == "console-migrate" {
 		return consoleMigrateCommand(os.Args[2:], os.Stdout)
@@ -56,6 +65,7 @@ func run() error {
 	listen := f.String("listen", "127.0.0.1:8443", "HTTPS listen address")
 	file := f.String("config", "/etc/argus-c2/server.json", "server configuration")
 	check := f.Bool("check", false, "validate configuration and exit")
+	legacyMonitoring := f.Bool("legacy-monitoring", false, "temporarily create legacy system metrics/info tasks for migration comparison")
 	out := f.String("out", "", "new backup file in a private directory")
 	var browser consoleFlags
 	f.StringVar(&browser.listen, "console-listen", "", "optional Console HTTPS listen address, e.g. 0.0.0.0:443")
@@ -172,10 +182,17 @@ func run() error {
 		fmt.Println("server configuration valid")
 		return nil
 	}
-	handler := (&api.Server{Store: store, Enrollment: enrollment.Service{Store: store, Issuer: issuer}, Admins: admins, Monitoring: consoleServer != nil}).Handler()
+	handler := (&api.Server{Store: store, Enrollment: enrollment.Service{Store: store, Issuer: issuer}, Admins: admins, Monitoring: *legacyMonitoring}).Handler()
 	server := &http.Server{Addr: c.Listen, Handler: handler, TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 40 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	alertCtx, stopAlerts := context.WithCancel(ctx)
+	alertsDone := make(chan struct{})
+	go func() {
+		defer close(alertsDone)
+		runAlertEvaluation(alertCtx, store)
+	}()
+	defer func() { stopAlerts(); <-alertsDone }()
 	servers := []*http.Server{server}
 	if consoleServer != nil {
 		servers = append(servers, consoleServer)

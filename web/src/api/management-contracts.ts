@@ -51,6 +51,8 @@ export const managedAgentSchema = z.strictObject({
   public_id: objectId,
   display_name: z.string(),
   hostname: z.string(),
+  tags: z.array(z.string().max(32)).max(16),
+  authorization: z.enum(['ACTIVE', 'DISABLED', 'REVOKED']),
   status: z.enum(['active', 'disabled']),
   last_seen_at: timestamp,
   created_at: timestamp,
@@ -76,6 +78,40 @@ export const managedTaskSchema = z
   })
   .refine(parametersMatch, { message: 'Invalid task parameters' })
 export type ManagedTask = z.infer<typeof managedTaskSchema>
+export const diagnosticEvidenceSchema = z.strictObject({
+  coverage: z.enum(['complete', 'partial', 'unavailable']),
+  resources_total: z.number().int().min(0).max(32),
+  resources_available: z.number().int().min(0).max(32),
+  truncated: z.boolean(),
+})
+export const diagnosticCollectionSchema = diagnosticEvidenceSchema.extend({
+  id: objectId,
+  boot_id: objectId,
+  collector_version: z.string(),
+  started_at: timestamp,
+  completed_at: timestamp,
+  duration_ms: z.number().int().nonnegative(),
+  listener_processes: z
+    .strictObject({
+      coverage: z.enum(['complete', 'partial', 'unavailable']),
+      scanned_processes: z.number().int().nonnegative(),
+      scanned_fds: z.number().int().nonnegative(),
+      items: z
+        .array(
+          z.strictObject({
+            protocol: z.string(),
+            address: z.string(),
+            port: z.number().int().min(0).max(65535),
+            pid: z.number().int().positive(),
+            process_name: z.string(),
+            process_start_ticks: z.string().regex(/^[0-9]+$/),
+            socket_inode: z.string().regex(/^[0-9]+$/),
+          }),
+        )
+        .max(128),
+    })
+    .optional(),
+})
 export const taskDetailSchema = z.strictObject({
   task: managedTaskSchema,
   result: z
@@ -84,6 +120,8 @@ export const taskDetailSchema = z.strictObject({
       error: z.string().max(128),
       completed_at: timestamp,
       payload: z.record(z.string(), z.json()),
+      evidence: diagnosticEvidenceSchema,
+      collection: diagnosticCollectionSchema.optional(),
     })
     .nullable(),
 })
@@ -150,3 +188,91 @@ export const agentsPageSchema = page(managedAgentSchema)
 export const tasksPageSchema = page(managedTaskSchema)
 export const auditPageSchema = page(auditEventSchema)
 export const usersPageSchema = page(managedUserSchema)
+
+export const diagnosticProfileSchema = z.strictObject({
+  id: z.enum(['overview', 'system', 'service', 'security']),
+  name: z.string(),
+  collectors: z.array(taskTypeSchema).min(1).max(6),
+  requires_resource: z.boolean(),
+})
+export const diagnosticProfilesSchema = z.array(diagnosticProfileSchema).max(16)
+export const diagnosticRequestSchema = z.strictObject({
+  node_ids: z
+    .array(objectId)
+    .min(1)
+    .max(50)
+    .refine((ids) => new Set(ids).size === ids.length),
+  profile_id: diagnosticProfileSchema.shape.id,
+  resource_id: z.string().max(32),
+  ttl_seconds: z.number().int().min(10).max(3600),
+  execution_timeout_ms: z.number().int().min(1).max(30000),
+})
+export type DiagnosticRequest = z.infer<typeof diagnosticRequestSchema>
+export const diagnosticBatchSchema = z.strictObject({
+  id: objectId,
+  profile_id: diagnosticProfileSchema.shape.id,
+  created_at: timestamp,
+  tasks: z
+    .array(
+      z.strictObject({
+        id: objectId,
+        node_id: objectId,
+        task_type: taskTypeSchema,
+        parameters: parameterSchema,
+        status: z.enum(taskStates),
+        created_at: timestamp,
+        dispatch_expires_at: timestamp,
+        execution_timeout_ms: z.number().int().positive(),
+        result_due_at: timestamp,
+      }),
+    )
+    .max(200),
+})
+export const alertRuleSchema = z.strictObject({
+  id: objectId,
+  metric: z.enum(['cpu_percent', 'memory_percent', 'disk_percent', 'telemetry_missing']),
+  severity: z.enum(['WARNING', 'CRITICAL']),
+  threshold: z.number().nonnegative(),
+  for_seconds: z.number().int().nonnegative(),
+  recovery_seconds: z.number().int().nonnegative(),
+  enabled: z.boolean(),
+})
+export type AlertRule = z.infer<typeof alertRuleSchema>
+export const alertRulesSchema = z.array(alertRuleSchema).max(32)
+export const alertSchema = z.strictObject({
+  id: objectId,
+  node_id: objectId,
+  rule_id: objectId,
+  severity: z.enum(['WARNING', 'CRITICAL']),
+  status: z.enum(['FIRING', 'RESOLVED']),
+  opened_at: timestamp,
+  last_observed_at: timestamp,
+  resolved_at: timestamp,
+  reason: z.string(),
+})
+export const alertsPageSchema = z.strictObject({
+  items: z.array(alertSchema).max(200),
+  next_cursor: z.string().optional(),
+})
+export const alertEventSchema = z.strictObject({
+  id: z.number().int().positive(),
+  alert_id: objectId,
+  node_id: objectId,
+  rule_id: objectId,
+  state: z.enum(['FIRING', 'RESOLVED']),
+  timestamp,
+  reason: z.string(),
+})
+export const alertEventsSchema = z.array(alertEventSchema).max(200)
+
+export const agentCapabilitiesSchema = z
+  .strictObject({
+    agent_version: z.string(),
+    protocol_version: z.number().int().positive(),
+    policy_version: z.number().int().positive(),
+    policy_hash: z.string(),
+    supported_collectors: z.array(taskTypeSchema).max(6),
+    allowed_collectors: z.array(taskTypeSchema).max(6),
+    reported_at: timestamp,
+  })
+  .nullable()

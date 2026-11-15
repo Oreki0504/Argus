@@ -100,6 +100,17 @@ def main():
         token.unlink()
         run("systemctl", "start", units[1])
         node = cli("nodes")[0]
+        def telemetry():
+            return cli("telemetry", "-node", node["id"], "-limit", "100")["items"]
+
+        deadline = time.monotonic() + 30
+        while not telemetry():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("independent telemetry did not start with the Agent")
+            time.sleep(1)
+        assert cli("tasks") == [], "default monitoring unexpectedly created diagnostic tasks"
+        assert (state / "probe.db").is_file() and (state / "telemetry.db").is_file()
+        task_ids = set()
         for kind in policy["allowed"]:
             options = ["create", "-node", node["id"], "-type", kind]
             if kind == "service.status":
@@ -107,12 +118,26 @@ def main():
             if kind == "ssh.audit":
                 options += ["-resource", "host"]
             job = cli(*options)
+            task_ids.add(job["id"])
             result = cli("wait", "-task", job["id"], "-timeout", "40s")
             assert result["task"]["status"] == "SUCCEEDED", result
             if kind == "service.status":
                 assert result["result"]["payload"]["available"], result
             if kind == "ssh.audit":
                 assert result["result"]["payload"]["coverage"] == "complete", result
+        deadline = time.monotonic() + 90
+        while True:
+            observations = telemetry()
+            if len(observations) >= 2:
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("telemetry did not continue while diagnostic collectors were exercised")
+            time.sleep(1)
+        assert all(sample["interval_seconds"] == 60 for sample in observations)
+        assert {task["id"] for task in cli("tasks")} == task_ids, "automatic diagnostic tasks were created"
+        previous_observations = {sample["sample_id"]: (sample["boot_id"], sample["observed_at"], sample["received_at"])
+                                 for sample in observations}
+        previous_boot_ids = {sample["boot_id"] for sample in observations}
         for unit in units:
             props = dict(line.split("=", 1) for line in run("systemctl", "show", unit,
                          "-p", "User", "-p", "NoNewPrivileges", "-p", "ProtectSystem",
@@ -129,8 +154,23 @@ def main():
                 time.sleep(0.1)
         else:
             raise RuntimeError("server did not become ready after restart")
-        assert cli("result", "-task", job["id"])["task"]["status"] == "SUCCEEDED"
-        print("Native systemd: six collectors, dedicated users, isolation, limits and restart passed")
+        assert cli("nodes")[0]["id"] == node["id"], "restart changed the enrolled node"
+        for task_id in task_ids:
+            assert cli("result", "-task", task_id)["task"]["status"] == "SUCCEEDED"
+        deadline = time.monotonic() + 30
+        while True:
+            observations = telemetry()
+            if any(sample["boot_id"] not in previous_boot_ids for sample in observations):
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Agent did not resume telemetry with a new boot ID after restart")
+            time.sleep(1)
+        restored_observations = {sample["sample_id"]: (sample["boot_id"], sample["observed_at"], sample["received_at"])
+                                 for sample in observations}
+        assert all(restored_observations.get(key) == value for key, value in previous_observations.items()), \
+            "restart lost or changed committed telemetry observations"
+        assert {task["id"] for task in cli("tasks")} == task_ids, "restart created diagnostic monitoring tasks"
+        print("Native systemd: six collectors, independent telemetry, dedicated users, isolation, limits and durable restart passed")
     except Exception:
         for unit in units:
             print(run("journalctl", "-u", unit, "--no-pager", "-n", "80"))

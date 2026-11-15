@@ -15,7 +15,8 @@ import {
 } from 'lucide-react'
 import { EmptyState, ErrorState, Loading, Notice, Status } from '../../components/ui'
 import { UtilizationStrip } from '../../components/UtilizationStrip'
-import { heartbeat } from '../../lib/format'
+import { observationStatus, statusLabel, sumObserved } from '../../lib/status'
+import { NodeStatuses } from '../../components/NodeStatuses'
 import { useViewer } from '../auth/context'
 import { useNow, useSummary } from './useSummary'
 import { usePreferences } from '../../preferences/context'
@@ -24,7 +25,7 @@ import type { PublicNode } from '../../api/contracts'
 const heartbeatFilters = [
   { value: 'all', label: 'All Server', tone: 'all' },
   { value: 'Online', label: 'Online', tone: 'online' },
-  { value: 'Stale', label: 'Stale', tone: 'stale' },
+  { value: 'Stale', label: 'Stale telemetry', tone: 'stale' },
   { value: 'Offline', label: 'Offline', tone: 'offline' },
 ] as const
 
@@ -118,28 +119,34 @@ export function AgentOverview() {
     )
   const data = summary.data
   const matching = data.nodes.filter((node) =>
-    node.display_name.toLowerCase().includes(search.toLowerCase()),
+    `${node.display_name} ${node.tags.join(' ')}`.toLowerCase().includes(search.toLowerCase()),
   )
   const filtered = matching.filter(
-    (node) => status === 'all' || heartbeat(node.last_seen_at, now) === status,
+    (node) =>
+      status === 'all' ||
+      (status === 'Stale'
+        ? observationStatus(node, now).telemetry === 'STALE'
+        : statusLabel(observationStatus(node, now).connectivity) === status),
   )
   const counts = matching.reduce<Record<string, number>>((result, node) => {
-    const state = heartbeat(node.last_seen_at, now)
+    const projected = observationStatus(node, now)
+    const state = statusLabel(projected.connectivity)
+    if (projected.telemetry === 'STALE') result.Stale = (result.Stale ?? 0) + 1
     result[state] = (result[state] ?? 0) + 1
     return result
   }, {})
 
   // Aggregate fleet-wide network totals and current throughput
-  const totalInBytes = data.nodes.reduce(
-    (acc, n) => acc + (n.traffic.sampled_inbound_bytes ?? 0),
-    0,
-  )
-  const totalOutBytes = data.nodes.reduce(
-    (acc, n) => acc + (n.traffic.sampled_outbound_bytes ?? 0),
-    0,
-  )
-  const totalInRate = data.nodes.reduce((acc, n) => acc + (n.traffic.inbound_bps ?? 0), 0)
-  const totalOutRate = data.nodes.reduce((acc, n) => acc + (n.traffic.outbound_bps ?? 0), 0)
+  const totalInBytes = sumObserved(data.nodes.map((n) => n.traffic.sampled_inbound_bytes))
+  const totalOutBytes = sumObserved(data.nodes.map((n) => n.traffic.sampled_outbound_bytes))
+  const freshNodes = data.nodes.filter((n) => observationStatus(n, now).telemetry === 'FRESH')
+  const totalInRate = sumObserved(freshNodes.map((n) => n.traffic.inbound_bps))
+  const totalOutRate = sumObserved(freshNodes.map((n) => n.traffic.outbound_bps))
+  const healthCounts = data.nodes.reduce<Record<string, number>>((totals, node) => {
+    const value = observationStatus(node, now).health
+    totals[value] = (totals[value] ?? 0) + 1
+    return totals
+  }, {})
 
   const sorted = [...filtered].sort((a: PublicNode, b: PublicNode) => {
     if (sortBy === 'default') return 0
@@ -288,6 +295,17 @@ export function AgentOverview() {
         </div>
       </div>
 
+      <div className="fleet-health-counts" aria-label={t('Fleet health')}>
+        {(['HEALTHY', 'WARNING', 'CRITICAL', 'UNKNOWN'] as const).map((health) => (
+          <span key={health}>
+            <Status>{statusLabel(health)}</Status> <strong>{healthCounts[health] ?? 0}</strong>
+          </span>
+        ))}
+        <span>
+          {t('Stale telemetry')}: <strong>{counts.Stale ?? 0}</strong>
+        </span>
+      </div>
+
       {/* Dedicated Control Bar: View Toggle + Status Pills + Search + Sort */}
       <div className="overview-toolbar">
         <div className="toolbar-left">
@@ -382,12 +400,10 @@ export function AgentOverview() {
           className={`agent-grid ${viewMode === 'strip' ? 'agent-grid-strip' : 'agent-grid-cards'}`}
         >
           {nodes.map((node) => {
-            const nodeStatus = heartbeat(node.last_seen_at, now)
+            const projected = observationStatus(node, now)
+            const nodeStatus = statusLabel(projected.connectivity)
             const isOffline = nodeStatus === 'Offline'
-            const stale =
-              !isOffline &&
-              ((node.resources.as_of !== null && now - node.resources.as_of > 90) ||
-                (node.traffic.as_of !== null && now - node.traffic.as_of > 90))
+            const stale = projected.telemetry === 'STALE'
             return (
               <article
                 className={`agent-card ${viewMode === 'strip' ? 'agent-card-strip' : ''} ${isOffline ? 'agent-offline-collapsed' : ''} ${stale ? 'agent-stale' : ''}`}
@@ -415,10 +431,13 @@ export function AgentOverview() {
                     <p>
                       {node.system.os ?? t('System unavailable')}
                       {node.system.architecture ? ` · ${node.system.architecture}` : ''}
+                      {node.tags.length > 0 && (
+                        <small className="node-tags">{node.tags.join(' · ')}</small>
+                      )}
                     </p>
                   </div>
                   <div className="agent-badges">
-                    <Status>{nodeStatus}</Status>
+                    <NodeStatuses node={node} now={now} />
                     {stale && <span className="stale-flag">{t('Stale observations')}</span>}
                   </div>
                 </div>

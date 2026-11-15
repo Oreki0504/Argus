@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNamedRolesAndInvalidCredentials(t *testing.T) {
@@ -39,6 +40,45 @@ func TestNamedRolesAndInvalidCredentials(t *testing.T) {
 	c.Users = append(c.Users, admin)
 	if c.Validate() == nil {
 		t.Fatal("duplicate identity accepted")
+	}
+}
+
+func TestAdministratorTokenExpirationAtRequestTime(t *testing.T) {
+	u, token, err := NewUser("expiring", "Admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.ExpiresAt = time.Now().Add(time.Hour).Unix()
+	path := filepath.Join(t.TempDir(), "admins.json")
+	raw, _ := json.Marshal(Config{Users: []User{u}})
+	if err = os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = loaded.Authenticate(token); err != nil {
+		t.Fatal(err)
+	}
+	loaded.Users[0].ExpiresAt = time.Now().Unix()
+	if _, err = loaded.Authenticate(token); err == nil {
+		t.Fatal("expired token authenticated")
+	}
+	loaded.Users[0].ExpiresAt = 0
+	if _, err = loaded.Authenticate(token); err != nil {
+		t.Fatal("legacy unexpired token changed", err)
+	}
+	loaded.Users[0].ExpiresAt = -1
+	if err = loaded.Validate(); err == nil {
+		t.Fatal("negative expiry accepted")
+	}
+	invalid := strings.Replace(string(raw), `"expires_at":`, `"Expires_at":`, 1)
+	if err = os.WriteFile(path, []byte(invalid), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = Load(path); err == nil {
+		t.Fatal("misspelled expiry accepted")
 	}
 }
 

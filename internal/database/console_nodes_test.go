@@ -31,6 +31,9 @@ func TestDeleteNodeRevokesIdentityAndKeepsAuditAtomically(t *testing.T) {
 	if _, err = s.DB.Exec("INSERT INTO enrollment_tokens(digest,expires_at,node_id) VALUES('old-token',9999999999,'node')"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err = s.SubmitTelemetry(ctx, c, protocol.TelemetryBatch{SchemaVersion: 1, Samples: []protocol.TelemetrySample{telemetrySample("delete-sample", time.Now().Unix())}}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = s.DB.Exec(`CREATE TRIGGER reject_delete_audit BEFORE INSERT ON audit_events WHEN NEW.action='node.delete' BEGIN SELECT RAISE(FAIL,'audit unavailable'); END`); err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +49,7 @@ func TestDeleteNodeRevokesIdentityAndKeepsAuditAtomically(t *testing.T) {
 	if err = s.DeleteConsoleNode(ctx, "admin", "node"); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"nodes", "tasks", "results", "console_nodes", "enrollment_tokens"} {
+	for _, table := range []string{"nodes", "tasks", "results", "telemetry_samples", "console_nodes", "enrollment_tokens"} {
 		var n int
 		if err = s.DB.QueryRow("SELECT count(*) FROM " + table).Scan(&n); err != nil || n != 0 {
 			t.Fatal(table, n, err)

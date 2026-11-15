@@ -18,7 +18,7 @@ type Storage struct {
 
 func InspectStorage(dir, name string) (Storage, error) {
 	var out Storage
-	if name != "argus.db" && name != "probe.db" {
+	if name != "argus.db" && name != "probe.db" && name != "telemetry.db" {
 		return out, errors.New("unknown state database")
 	}
 	for _, suffix := range []string{"", "-wal"} {

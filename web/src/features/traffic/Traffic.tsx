@@ -4,6 +4,7 @@ import { Activity, ArrowDownLeft, ArrowUpRight } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { Direction, EmptyState, ErrorState, Loading, Notice, PageHeader } from '../../components/ui'
 import { useViewer } from '../auth/context'
+import { observationStatus, sumObserved } from '../../lib/status'
 import { useNow, useSummary } from '../fleet/useSummary'
 
 export function TrafficPage() {
@@ -30,8 +31,9 @@ export function TrafficPage() {
   const totalOut = outgoing.length
     ? outgoing.reduce((sum, node) => sum + node.traffic.sampled_outbound_bytes!, 0)
     : null
-  const totalInRate = data.nodes.reduce((sum, node) => sum + (node.traffic.inbound_bps ?? 0), 0)
-  const totalOutRate = data.nodes.reduce((sum, node) => sum + (node.traffic.outbound_bps ?? 0), 0)
+  const freshNodes = data.nodes.filter((node) => observationStatus(node, now).telemetry === 'FRESH')
+  const totalInRate = sumObserved(freshNodes.map((node) => node.traffic.inbound_bps))
+  const totalOutRate = sumObserved(freshNodes.map((node) => node.traffic.outbound_bps))
   return (
     <section className="traffic-page">
       <PageHeader

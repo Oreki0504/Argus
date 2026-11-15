@@ -26,6 +26,7 @@ import (
 	"github.com/Oreki0504/Argus-C2/internal/api"
 	"github.com/Oreki0504/Argus-C2/internal/database"
 	"github.com/Oreki0504/Argus-C2/internal/enrollment"
+	"github.com/Oreki0504/Argus-C2/internal/identity"
 	"github.com/Oreki0504/Argus-C2/internal/protocol"
 	jose "github.com/go-jose/go-jose/v4"
 )
@@ -541,14 +542,51 @@ func TestConsoleRealManagementAndPublicProjection(t *testing.T) {
 	}
 	metrics := protocol.SystemMeasurements{CPU: protocol.CPUStats{Available: true, BusyPercent: 25, WindowMS: 1000}, Memory: protocol.MemoryStats{Available: true, TotalBytes: 1000, AvailableBytes: 400}, Disks: []protocol.DiskStats{{Path: "/private/data", Available: true, TotalBytes: 2000, AvailableBytes: 1000}}, Networks: []protocol.NetworkStats{{Interface: "private0", Available: true, RXBytes: 100, TXBytes: 200}}}
 	payload, _ = json.Marshal(metrics)
-	if err = s.store.SubmitResult(ctx, cert, protocol.Result{TaskID: metricsTask.ID, NodeID: enrolled.NodeID, Status: protocol.Succeeded, Payload: payload, CompletedAt: time.Now().Unix()}); err != nil {
+	completedAt := time.Now().Unix()
+	metricsResult := protocol.Result{TaskID: metricsTask.ID, NodeID: enrolled.NodeID, Status: protocol.Succeeded, Payload: payload, CompletedAt: completedAt}
+	evidence, err := protocol.DiagnosticEvidenceFor(metricsTask.Task, metricsResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metricsResult.Collection = &protocol.DiagnosticCollection{ID: identity.RandomID(), BootID: identity.RandomID(), CollectorVersion: "test", StartedAt: completedAt - 1, CompletedAt: completedAt, DurationMS: 1000, DiagnosticEvidence: evidence}
+	if err = s.store.SubmitResult(ctx, cert, metricsResult); err != nil {
 		t.Fatal(err)
 	}
 	detail := decodeTest[taskDetail](t, admin.request("GET", "/v1/console/admin/tasks/"+metricsTask.ID, nil, "", nil), 200)
-	if detail.Result == nil || detail.Task.ExecutionAuthorizedAt == nil || detail.Task.Status != protocol.Succeeded {
+	if detail.Result == nil || detail.Result.Collection == nil || detail.Result.Collection.ID != metricsResult.Collection.ID || detail.Result.Evidence.Coverage != "complete" || detail.Task.ExecutionAuthorizedAt == nil || detail.Task.Status != protocol.Succeeded {
 		t.Fatal(detail)
 	}
+	listenerTask := create(protocol.NetworkListeners)
+	listenerAssignment, err := s.store.Poll(ctx, cert)
+	if err != nil || listenerAssignment == nil || listenerAssignment.ID != listenerTask.ID {
+		t.Fatal(listenerAssignment, err)
+	}
+	if err = s.store.Running(ctx, cert, listenerTask.ID); err != nil {
+		t.Fatal(err)
+	}
+	listenerPayload, _ := json.Marshal(protocol.Listeners{Available: true, Coverage: "complete", Items: []protocol.Listener{{Protocol: "tcp", Address: "127.0.0.1", Port: 8080}}})
+	listenerResult := protocol.Result{TaskID: listenerTask.ID, NodeID: enrolled.NodeID, Status: protocol.Succeeded, Payload: listenerPayload, CompletedAt: completedAt}
+	listenerEvidence, err := protocol.DiagnosticEvidenceFor(listenerTask.Task, listenerResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listenerResult.Collection = &protocol.DiagnosticCollection{ID: identity.RandomID(), BootID: metricsResult.Collection.BootID, CollectorVersion: "test", StartedAt: completedAt - 1, CompletedAt: completedAt, DurationMS: 1000, DiagnosticEvidence: listenerEvidence, ListenerProcesses: &protocol.ListenerProcesses{Coverage: "partial", ScannedProcesses: 2, ScannedFDs: 4, Items: []protocol.ListenerProcess{{Protocol: "tcp", Address: "127.0.0.1", Port: 8080, PID: 42, ProcessName: "private-process", ProcessStartTicks: "9007199254740993", SocketInode: "9007199254740995"}}}}
+	if err = s.store.SubmitResult(ctx, cert, listenerResult); err != nil {
+		t.Fatal(err)
+	}
+	listenerDetail := decodeTest[taskDetail](t, admin.request("GET", "/v1/console/admin/tasks/"+listenerTask.ID, nil, "", nil), 200)
+	if listenerDetail.Result == nil || listenerDetail.Result.Collection == nil || listenerDetail.Result.Collection.ListenerProcesses == nil || listenerDetail.Result.Collection.ListenerProcesses.Items[0].ProcessStartTicks != "9007199254740993" {
+		t.Fatal("listener metadata was not persisted", listenerDetail)
+	}
 	guest := newBrowser(t, s)
+	withoutTelemetry := decodeTest[publicSummary](t, guest.request("GET", "/v1/console/public/summary", nil, "", nil), 200)
+	if withoutTelemetry.Nodes[0].Resources.CPU != nil || withoutTelemetry.Nodes[0].Status.Health != "UNKNOWN" || withoutTelemetry.Nodes[0].Status.Telemetry != "MISSING" {
+		t.Fatal("diagnostic result leaked into periodic telemetry", withoutTelemetry)
+	}
+	sample := protocol.TelemetrySample{SampleID: identity.RandomID(), BootID: identity.RandomID(), ObservedAt: time.Now().Unix(), AgentVersion: "test", IntervalSeconds: 60, Metrics: metrics, System: info, Errors: []protocol.TelemetryCollectionError{}}
+	if _, err = s.store.SubmitTelemetry(ctx, cert, protocol.TelemetryBatch{SchemaVersion: 1, Samples: []protocol.TelemetrySample{sample}}); err != nil {
+		t.Fatal(err)
+	}
 	response := guest.request("GET", "/v1/console/public/summary", nil, "", nil)
 	summary := decodeTest[publicSummary](t, response, 200)
 	if len(summary.Nodes) != 1 || *summary.Nodes[0].Resources.CPU != 25 || summary.Nodes[0].Traffic.Inbound != nil || *summary.Nodes[0].System.OS != "Ubuntu 24.04" {
@@ -588,7 +626,7 @@ func TestConsoleRealManagementAndPublicProjection(t *testing.T) {
 	if vme["role"] != "User" {
 		t.Fatal(vme)
 	}
-	for _, path := range []string{"tasks", "agents", "audit", "users"} {
+	for _, path := range []string{"tasks", "agents", "audit", "users", "diagnostic-profiles", "alerts", "alert-events", "alert-rules"} {
 		if w := viewer.request("GET", "/v1/console/admin/"+path, nil, "", nil); w.Code != 403 {
 			t.Fatal("User read management", path, w.Code)
 		}
@@ -635,7 +673,7 @@ func TestConsoleRealManagementAndPublicProjection(t *testing.T) {
 		t.Fatal("token leaked into audit")
 	}
 	tasks := decodeTest[page[managedTask]](t, admin.request("GET", "/v1/console/admin/tasks?limit=1", nil, "", nil), 200)
-	if tasks.Total != 3 || tasks.NextCursor == nil {
+	if tasks.Total != 4 || tasks.NextCursor == nil {
 		t.Fatal("task page invalid", tasks)
 	}
 	next := decodeTest[page[managedTask]](t, admin.request("GET", "/v1/console/admin/tasks?limit=1&cursor="+url.QueryEscape(*tasks.NextCursor), nil, "", nil), 200)
@@ -646,7 +684,7 @@ func TestConsoleRealManagementAndPublicProjection(t *testing.T) {
 		t.Fatal("cursor allowed changed filter")
 	}
 	if output := os.Getenv("ARGUS_CONSOLE_CONTRACT_FILE"); output != "" {
-		golden := map[string]any{"identity": me, "summary": summary, "history": history, "agents": agents, "tasks": tasks, "task": detail, "users": users, "audit": audit, "enrollment": token}
+		golden := map[string]any{"identity": me, "summary": summary, "history": history, "agents": agents, "tasks": tasks, "task": detail, "listener_task": listenerDetail, "users": users, "audit": audit, "enrollment": token}
 		data, err := json.MarshalIndent(golden, "", "  ")
 		if err != nil {
 			t.Fatal(err)
@@ -704,4 +742,75 @@ func TestConsoleSessionCookieFlagsAndExpiry(t *testing.T) {
 	if w := b.request("GET", "/v1/me", nil, "", nil); w.Code != 401 {
 		t.Fatal("idle expiry failed")
 	}
+}
+
+func TestConsoleObservationManagement(t *testing.T) {
+	s, _, admin := testConsole(t)
+	csrfToken := admin.identity()["csrf_token"].(string)
+	guest := newBrowser(t, s)
+	agent := managedAgent{NodeID: identity.RandomID()}
+	now := time.Now().Unix()
+	if _, err := s.store.DB.Exec(`INSERT INTO nodes(id,hostname,certificate_fingerprint,status,last_seen_at,created_at,certificate_expires_at,certificate) VALUES(?,'private','test-fp','active',?,?,?,'cert')`, agent.NodeID, now, now, now+1000); err != nil {
+		t.Fatal(err)
+	}
+	// Profile batches and alert administration retain the same Admin/session/CSRF boundaries.
+	capabilityPath := "/v1/console/admin/agents/" + agent.NodeID + "/capabilities"
+	decodeTest[map[string]string](t, guest.request("GET", capabilityPath, nil, "", nil), 401)
+	missingCapability := decodeTest[*database.ReportedCapabilities](t, admin.request("GET", capabilityPath, nil, "", nil), 200)
+	if missingCapability != nil {
+		t.Fatal("missing capability invented", missingCapability)
+	}
+	profiles := decodeTest[[]protocol.DiagnosticProfile](t, admin.request("GET", "/v1/console/admin/diagnostic-profiles", nil, "", nil), 200)
+	if len(profiles) != 4 {
+		t.Fatal(profiles)
+	}
+	for _, path := range []string{"/v1/console/admin/diagnostic-profiles", "/v1/console/admin/alerts", "/v1/console/admin/alert-events", "/v1/console/admin/alert-rules"} {
+		decodeTest[map[string]string](t, guest.request("GET", path, nil, "", nil), 401)
+	}
+	tagsPath := "/v1/console/admin/agents/" + agent.NodeID + "/tags"
+	decodeTest[map[string]string](t, admin.request("POST", tagsPath, map[string]any{"tags": []string{"prod"}}, "wrong", nil), 403)
+	decodeTest[map[string]any](t, admin.request("POST", tagsPath, map[string]any{"tags": []string{"prod", "region:jp"}}, csrfToken, nil), 200)
+	decodeTest[map[string]string](t, admin.request("POST", tagsPath, map[string]any{"tags": []string{"bad tag"}}, csrfToken, nil), 400)
+	publicNode := decodeTest[publicSummary](t, guest.request("GET", "/v1/console/public/summary", nil, "", nil), 200).Nodes[0]
+	if len(publicNode.Tags) != 2 || publicNode.Tags[0] != "prod" {
+		t.Fatal(publicNode.Tags)
+	}
+	diagnosticRequest := protocol.DiagnosticRequest{NodeIDs: []string{agent.NodeID}, ProfileID: "system", TTLSeconds: 300, ExecutionTimeoutMS: 10000}
+	decodeTest[map[string]string](t, admin.request("POST", "/v1/console/admin/diagnostics", diagnosticRequest, "wrong", nil), 403)
+	batch := decodeTest[database.DiagnosticBatch](t, admin.request("POST", "/v1/console/admin/diagnostics", diagnosticRequest, csrfToken, nil), 200)
+	if len(batch.Tasks) != 2 {
+		t.Fatal(batch)
+	}
+	readBatch := decodeTest[database.DiagnosticBatch](t, admin.request("GET", "/v1/console/admin/diagnostics/"+batch.ID, nil, "", nil), 200)
+	if readBatch.ID != batch.ID || len(readBatch.Tasks) != 2 {
+		t.Fatal(readBatch)
+	}
+	cancelPath := "/v1/console/admin/tasks/" + batch.Tasks[0].ID + "/cancel"
+	decodeTest[map[string]any](t, admin.request("POST", cancelPath, struct{}{}, csrfToken, nil), 200)
+	cancelled := decodeTest[taskDetail](t, admin.request("GET", "/v1/console/admin/tasks/"+batch.Tasks[0].ID, nil, "", nil), 200)
+	if cancelled.Task.Status != protocol.Failed || cancelled.Result == nil || cancelled.Result.Error != "cancelled_before_dispatch" || cancelled.Result.Evidence.Coverage != "unavailable" {
+		t.Fatal(cancelled)
+	}
+	decodeTest[map[string]any](t, admin.request("POST", cancelPath, struct{}{}, csrfToken, nil), 200)
+	rules := decodeTest[[]database.AlertRule](t, admin.request("GET", "/v1/console/admin/alert-rules", nil, "", nil), 200)
+	if len(rules) != 4 {
+		t.Fatal(rules)
+	}
+	rule := rules[0]
+	rule.Threshold = 88
+	decodeTest[map[string]string](t, admin.request("POST", "/v1/console/admin/alert-rules", rule, "wrong", nil), 403)
+	decodeTest[map[string]any](t, admin.request("POST", "/v1/console/admin/alert-rules", rule, csrfToken, nil), 200)
+	decodeTest[database.AlertPage](t, admin.request("GET", "/v1/console/admin/alerts?limit=25", nil, "", nil), 200)
+	decodeTest[[]database.AlertEvent](t, admin.request("GET", "/v1/console/admin/alert-events?after=0&limit=25", nil, "", nil), 200)
+	revokePath := "/v1/console/admin/agents/" + agent.NodeID + "/revoke"
+	decodeTest[map[string]string](t, admin.request("POST", revokePath, map[string]string{"confirm_node_id": "wrong"}, csrfToken, nil), 400)
+	decodeTest[map[string]any](t, admin.request("POST", revokePath, map[string]string{"confirm_node_id": agent.NodeID}, csrfToken, nil), 200)
+	revoked := decodeTest[publicSummary](t, guest.request("GET", "/v1/console/public/summary", nil, "", nil), 200).Nodes[0]
+	if revoked.Status.Authorization != "REVOKED" || revoked.Status.Connectivity != "ONLINE" {
+		t.Fatal(revoked.Status)
+	}
+	for _, path := range []string{"/v1/console/admin/alerts?status=bad", "/v1/console/admin/alerts?limit=201", "/v1/console/admin/alert-events?after=-1", "/v1/console/admin/alert-events?cursor=bad"} {
+		decodeTest[map[string]string](t, admin.request("GET", path, nil, "", nil), 400)
+	}
+
 }

@@ -10,6 +10,14 @@ export const metrics = [
   { key: 'outbound_percent', label: 'Outbound', title: 'Outbound bandwidth', tone: 'outbound' },
 ] as const
 export type MetricKey = (typeof metrics)[number]['key']
+export const historyMetrics = [
+  metrics[0],
+  metrics[1],
+  metrics[2],
+  { key: 'inbound_bps', label: 'Inbound', title: 'Inbound throughput', tone: 'inbound' },
+  { key: 'outbound_bps', label: 'Outbound', title: 'Outbound throughput', tone: 'outbound' },
+] as const
+export type HistoryMetricKey = (typeof historyMetrics)[number]['key']
 export type SeverityTone = 'normal' | 'warning' | 'critical' | 'unknown'
 
 export function utilizationSeverity(value: number | null): SeverityTone {
@@ -106,19 +114,24 @@ export function nodeMetrics(node: PublicNode, language: Language = 'en') {
 }
 
 // Break both explicit null observations and missing intervals. Never bridge gaps.
-export function seriesSegments(history: NodeHistory, key: MetricKey): HistoryPoint[][] {
+export function seriesSegments(
+  history: NodeHistory,
+  key: MetricKey | HistoryMetricKey,
+): HistoryPoint[][] {
   const segments: HistoryPoint[][] = []
   let segment: HistoryPoint[] = []
   let previous: number | null = null
   for (const point of history.points) {
     if (
       point[key] === null ||
+      point.gap_before ||
+      point.clock_skew ||
       (previous !== null && point.timestamp - previous > history.sample_interval_seconds * 1.5)
     ) {
       if (segment.length) segments.push(segment)
       segment = []
     }
-    if (point[key] !== null) segment.push(point)
+    if (point[key] !== null && !point.clock_skew) segment.push(point)
     previous = point.timestamp
   }
   if (segment.length) segments.push(segment)

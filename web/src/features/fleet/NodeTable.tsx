@@ -2,8 +2,8 @@ import { useFormat } from '../../lib/useFormat'
 import { ArrowUpRight, Server } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import type { PublicNode } from '../../api/contracts'
-import { EmptyState, ResourceMeter, Status } from '../../components/ui'
-import { heartbeat } from '../../lib/format'
+import { EmptyState, ResourceMeter } from '../../components/ui'
+import { NodeStatuses } from '../../components/NodeStatuses'
 
 export function NodeTable({ nodes, now }: { nodes: PublicNode[]; now: number }) {
   const { relativeTime, timestampLabel } = useFormat()
@@ -47,7 +47,7 @@ export function NodeTable({ nodes, now }: { nodes: PublicNode[]; now: number }) 
                 </Link>
               </th>
               <td>
-                <Status>{heartbeat(node.last_seen_at, now)}</Status>
+                <NodeStatuses node={node} now={now} />
               </td>
               <td>
                 <ResourceMeter

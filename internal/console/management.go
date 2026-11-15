@@ -18,19 +18,21 @@ import (
 )
 
 type managedAgent struct {
-	NodeID               string `json:"node_id"`
-	PublicID             string `json:"public_id"`
-	DisplayName          string `json:"display_name"`
-	Hostname             string `json:"hostname"`
-	Status               string `json:"status"`
-	LastSeenAt           int64  `json:"last_seen_at"`
-	CreatedAt            int64  `json:"created_at"`
-	AgentVersion         string `json:"agent_version"`
-	ProtocolVersion      int    `json:"protocol_version"`
-	CertificateExpiresAt int64  `json:"certificate_expires_at"`
+	Tags                 []string `json:"tags"`
+	Authorization        string   `json:"authorization"`
+	NodeID               string   `json:"node_id"`
+	PublicID             string   `json:"public_id"`
+	DisplayName          string   `json:"display_name"`
+	Hostname             string   `json:"hostname"`
+	Status               string   `json:"status"`
+	LastSeenAt           int64    `json:"last_seen_at"`
+	CreatedAt            int64    `json:"created_at"`
+	AgentVersion         string   `json:"agent_version"`
+	ProtocolVersion      int      `json:"protocol_version"`
+	CertificateExpiresAt int64    `json:"certificate_expires_at"`
 }
 
-const agentColumns = "n.id,p.public_id,p.display_name,n.hostname,n.status,n.last_seen_at,n.created_at,n.agent_version,n.protocol_version,n.certificate_expires_at"
+const agentColumns = "n.id,p.public_id,p.display_name,n.hostname,n.status,n.last_seen_at,n.created_at,n.agent_version,n.protocol_version,n.certificate_expires_at,(SELECT json_group_array(tag) FROM (SELECT tag FROM node_tags WHERE node_id=n.id ORDER BY tag)),CASE WHEN EXISTS(SELECT 1 FROM node_revocations WHERE node_id=n.id) THEN 'REVOKED' WHEN n.status='disabled' THEN 'DISABLED' ELSE 'ACTIVE' END"
 
 func publicName(name, id string) string {
 	if name != "" {
@@ -43,8 +45,12 @@ func publicName(name, id string) string {
 }
 func scanAgent(row scanner) (managedAgent, error) {
 	var a managedAgent
-	err := row.Scan(&a.NodeID, &a.PublicID, &a.DisplayName, &a.Hostname, &a.Status, &a.LastSeenAt, &a.CreatedAt, &a.AgentVersion, &a.ProtocolVersion, &a.CertificateExpiresAt)
+	var tags string
+	err := row.Scan(&a.NodeID, &a.PublicID, &a.DisplayName, &a.Hostname, &a.Status, &a.LastSeenAt, &a.CreatedAt, &a.AgentVersion, &a.ProtocolVersion, &a.CertificateExpiresAt, &tags, &a.Authorization)
 	a.DisplayName = publicName(a.DisplayName, a.PublicID)
+	if err == nil {
+		err = json.Unmarshal([]byte(tags), &a.Tags)
+	}
 	return a, err
 }
 
@@ -71,10 +77,12 @@ func (s *Server) managedTask(r *http.Request, id string) (managedTask, error) {
 }
 
 type managedResult struct {
-	Status      protocol.TaskStatus `json:"status"`
-	Error       string              `json:"error"`
-	CompletedAt int64               `json:"completed_at"`
-	Payload     json.RawMessage     `json:"payload"`
+	Collection  *protocol.DiagnosticCollection `json:"collection,omitempty"`
+	Evidence    protocol.DiagnosticEvidence    `json:"evidence"`
+	Status      protocol.TaskStatus            `json:"status"`
+	Error       string                         `json:"error"`
+	CompletedAt int64                          `json:"completed_at"`
+	Payload     json.RawMessage                `json:"payload"`
 }
 type taskDetail struct {
 	Task   managedTask    `json:"task"`
@@ -204,6 +212,7 @@ func respondPage[T any](s *Server, w http.ResponseWriter, r *http.Request, spec 
 	reply(w, out)
 }
 func (s *Server) managementRoutes(mux *http.ServeMux) {
+	s.observationManagementRoutes(mux)
 	wrap := func(f func(http.ResponseWriter, *http.Request, database.ConsoleUser, session)) http.HandlerFunc {
 		return s.authorized(true, f)
 	}
@@ -439,7 +448,12 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request, _ database.Console
 	out := taskDetail{Task: t}
 	if view.Result != nil {
 		v := view.Result
-		out.Result = &managedResult{v.Status, v.Error, v.CompletedAt, v.Payload}
+		evidence, err := protocol.DiagnosticEvidenceFor(view.Task, *v)
+		if err != nil {
+			storeProblem(w, err)
+			return
+		}
+		out.Result = &managedResult{Status: v.Status, Error: v.Error, CompletedAt: v.CompletedAt, Payload: v.Payload, Collection: v.Collection, Evidence: evidence}
 	}
 	reply(w, out)
 }

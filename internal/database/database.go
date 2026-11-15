@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -42,7 +43,7 @@ func (s *Store) now() time.Time {
 	return time.Now()
 }
 
-const SchemaVersion = 104
+const SchemaVersion = 105
 const applicationID = 0x41524753 // ARGS
 
 const schema = `
@@ -81,7 +82,7 @@ func Open(dir string, create bool) (*Store, error) {
 		if e != nil {
 			return fail(e)
 		}
-		if _, e = tx.Exec(schema + consoleSchema + consoleAccountSchema); e != nil {
+		if _, e = tx.Exec(schema + consoleSchema + consoleAccountSchema + telemetrySchema); e != nil {
 			tx.Rollback()
 			return fail(e)
 		}
@@ -127,7 +128,9 @@ func auditSubject(ctx context.Context, tx *sql.Tx, actor, action, node, task, su
 	if _, e := tx.ExecContext(ctx, "INSERT INTO audit_events(timestamp,actor,action,node_id,task_id,subject_id,status) VALUES(?,?,?,?,?,?,?)", time.Now().Unix(), actor, action, node, task, subject, status); e != nil {
 		return e
 	}
-	_, e := tx.ExecContext(ctx, "DELETE FROM audit_events WHERE id <= (SELECT max(id)-? FROM audit_events)", AuditCapacity)
+	_, e := tx.ExecContext(ctx, `DELETE FROM audit_events WHERE id IN (
+ SELECT id FROM audit_events WHERE id <= (SELECT max(id) FROM audit_events)-
+ (SELECT capacity FROM audit_settings WHERE id=1) ORDER BY id LIMIT ?)`, MaxAuditPruneBatch)
 	return e
 }
 
@@ -188,7 +191,7 @@ func Authorize(ctx context.Context, tx *sql.Tx, c *x509.Certificate) (string, er
 	}
 	var fp, previous, status string
 	var until int64
-	if e = tx.QueryRowContext(ctx, "SELECT certificate_fingerprint,previous_fingerprint,previous_until,status FROM nodes WHERE id=?", id).Scan(&fp, &previous, &until, &status); e != nil {
+	if e = tx.QueryRowContext(ctx, "SELECT certificate_fingerprint,previous_fingerprint,previous_until,status FROM nodes WHERE id=? AND NOT EXISTS(SELECT 1 FROM node_revocations WHERE node_id=nodes.id)", id).Scan(&fp, &previous, &until, &status); e != nil {
 		return "", ErrUnauthorized
 	}
 	got := identity.Fingerprint(c)
@@ -203,7 +206,10 @@ func (s *Store) Authorize(ctx context.Context, c *x509.Certificate) (string, err
 	return id, e
 }
 func (s *Store) Nodes(ctx context.Context, after string) ([]protocol.Node, error) {
-	rows, e := s.DB.QueryContext(ctx, "SELECT id,hostname,certificate_fingerprint,status,last_seen_at,created_at,certificate_expires_at,protocol_version,agent_version FROM nodes WHERE id>? ORDER BY id LIMIT 200", after)
+	rows, e := s.DB.QueryContext(ctx, `SELECT n.id,n.hostname,n.certificate_fingerprint,n.status,n.last_seen_at,n.created_at,n.certificate_expires_at,n.protocol_version,n.agent_version,
+ CASE WHEN EXISTS(SELECT 1 FROM node_revocations r WHERE r.node_id=n.id) THEN 'REVOKED' WHEN n.status='disabled' THEN 'DISABLED' ELSE 'ACTIVE' END,
+ (SELECT json_group_array(tag) FROM (SELECT tag FROM node_tags WHERE node_id=n.id ORDER BY tag))
+ FROM nodes n WHERE n.id>? ORDER BY n.id LIMIT 200`, after)
 	if e != nil {
 		return nil, e
 	}
@@ -211,7 +217,11 @@ func (s *Store) Nodes(ctx context.Context, after string) ([]protocol.Node, error
 	out := []protocol.Node{}
 	for rows.Next() {
 		var n protocol.Node
-		if e = rows.Scan(&n.ID, &n.Hostname, &n.CertificateFingerprint, &n.Status, &n.LastSeenAt, &n.CreatedAt, &n.CertificateExpiresAt, &n.ProtocolVersion, &n.AgentVersion); e != nil {
+		var tags []byte
+		if e = rows.Scan(&n.ID, &n.Hostname, &n.CertificateFingerprint, &n.Status, &n.LastSeenAt, &n.CreatedAt, &n.CertificateExpiresAt, &n.ProtocolVersion, &n.AgentVersion, &n.Authorization, &tags); e != nil {
+			return nil, e
+		}
+		if e = json.Unmarshal(tags, &n.Tags); e != nil {
 			return nil, e
 		}
 		out = append(out, n)
@@ -245,6 +255,9 @@ func (s *Store) Disable(ctx context.Context, actor, id string) error {
 			return ErrNotFound
 		}
 		if e = finishOutstanding(ctx, tx, id, "node_disabled", s.now().Unix()); e != nil {
+			return e
+		}
+		if e = closeNodeAlerts(ctx, tx, id, s.now().Unix(), "node_disabled"); e != nil {
 			return e
 		}
 		return Audit(ctx, tx, actor, "node.disable", id, "", "succeeded")

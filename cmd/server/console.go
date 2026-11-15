@@ -58,7 +58,7 @@ func consoleMigrateCommand(args []string, out io.Writer) error {
 	if err = database.MigrateConsole(context.Background(), c.StateDir, *backup); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintln(out, "Server schema migrated to 104; verified pre-upgrade backup:", *backup)
+	_, err = fmt.Fprintf(out, "Server schema migrated to %d; verified pre-upgrade backup: %s\n", database.SchemaVersion, *backup)
 	return err
 }
 func consoleBootstrapCommand(args []string, out io.Writer) error {

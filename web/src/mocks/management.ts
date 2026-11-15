@@ -2,6 +2,11 @@ import { http, HttpResponse } from 'msw'
 import type { Identity, Summary } from '../api/contracts'
 import {
   createTaskSchema,
+  diagnosticRequestSchema,
+  diagnosticProfilesSchema,
+  diagnosticBatchSchema,
+  alertRuleSchema,
+  type AlertRule,
   disableAgentSchema,
   enrollmentRequestSchema,
   updateUserSchema,
@@ -20,6 +25,8 @@ export function managementFixture(summary: Summary) {
     public_id: node.public_id,
     display_name: node.display_name,
     hostname: `preview-linux-${i + 1}`,
+    tags: node.tags,
+    authorization: node.status.authorization,
     status: 'active',
     last_seen_at: node.last_seen_at,
     created_at: now - 86400 * 28,
@@ -63,6 +70,12 @@ export function managementFixture(summary: Summary) {
           ? {
               status,
               error: '',
+              evidence: {
+                coverage: 'complete',
+                resources_total: 1,
+                resources_available: 1,
+                truncated: false,
+              },
               completed_at: now - 80,
               payload: { os: 'Linux', architecture: 'x86_64', kernel: '6.8.0' },
             }
@@ -70,6 +83,12 @@ export function managementFixture(summary: Summary) {
             ? {
                 status,
                 error: 'local_policy_denied',
+                evidence: {
+                  coverage: 'unavailable',
+                  resources_total: 0,
+                  resources_available: 0,
+                  truncated: false,
+                },
                 completed_at: now - i * 120 - 80,
                 payload: {},
               }
@@ -203,6 +222,12 @@ export function managementHandlers(
         entry.result = {
           status: 'SUCCEEDED',
           error: '',
+          evidence: {
+            coverage: 'complete',
+            resources_total: 1,
+            resources_available: 1,
+            truncated: false,
+          },
           completed_at: now,
           payload: {
             preview: true,
@@ -218,7 +243,177 @@ export function managementHandlers(
       }
     }
   }
+  const profiles = diagnosticProfilesSchema.parse([
+    {
+      id: 'overview',
+      name: 'System investigation',
+      collectors: ['system.info', 'system.metrics', 'process.list', 'network.listeners'],
+      requires_resource: false,
+    },
+    {
+      id: 'system',
+      name: 'System snapshot',
+      collectors: ['system.info', 'system.metrics'],
+      requires_resource: false,
+    },
+    {
+      id: 'service',
+      name: 'Service status',
+      collectors: ['service.status'],
+      requires_resource: true,
+    },
+    {
+      id: 'security',
+      name: 'SSH configuration audit',
+      collectors: ['ssh.audit'],
+      requires_resource: true,
+    },
+  ])
+  const batches = new Map<
+    string,
+    { id: string; profile_id: string; created_at: number; taskIds: string[] }
+  >()
+  const rules: AlertRule[] = [
+    {
+      id: 'cpu-critical',
+      metric: 'cpu_percent',
+      severity: 'CRITICAL',
+      threshold: 90,
+      for_seconds: 120,
+      recovery_seconds: 120,
+      enabled: true,
+    },
+    {
+      id: 'telemetry-missing',
+      metric: 'telemetry_missing',
+      severity: 'WARNING',
+      threshold: 180,
+      for_seconds: 0,
+      recovery_seconds: 120,
+      enabled: true,
+    },
+  ]
+  const batchResponse = (batch: {
+    id: string
+    profile_id: string
+    created_at: number
+    taskIds: string[]
+  }) =>
+    diagnosticBatchSchema.parse({
+      id: batch.id,
+      profile_id: batch.profile_id,
+      created_at: batch.created_at,
+      tasks: batch.taskIds.map((taskId) => {
+        const task = state.tasks.find((entry) => entry.task.id === taskId)!.task
+        return {
+          id: task.id,
+          node_id: task.node_id,
+          task_type: task.task_type,
+          parameters: task.parameters,
+          status: task.status,
+          created_at: task.created_at,
+          dispatch_expires_at: task.dispatch_expires_at,
+          execution_timeout_ms: task.execution_timeout_ms,
+          result_due_at: task.result_due_at,
+        }
+      }),
+    })
   return [
+    http.get(
+      `${root}/diagnostic-profiles`,
+      ({ request }) => authorize(request, 'tasks:read') ?? json(profiles),
+    ),
+    http.post(`${root}/diagnostics`, async ({ request }) => {
+      const denied = authorize(request, 'tasks:write', true)
+      if (denied) return denied
+      const parsed = diagnosticRequestSchema.safeParse(await readBody(request))
+      if (!parsed.success) return problem('invalid_request')
+      const value = parsed.data
+      const profile = profiles.find((entry) => entry.id === value.profile_id)!
+      const agents = value.node_ids.map((id) => state.agents.find((agent) => agent.node_id === id))
+      if (agents.some((agent) => !agent || agent.status !== 'active'))
+        return problem('node_disabled', 409)
+      const now = Math.floor(Date.now() / 1000)
+      const taskIds: string[] = []
+      for (const agent of agents)
+        for (const task_type of profile.collectors) {
+          const id = randomId()
+          taskIds.push(id)
+          newlyCreated.add(id)
+          state.tasks.unshift({
+            task: {
+              id,
+              node_id: agent!.node_id,
+              agent_name: agent!.display_name,
+              task_type,
+              parameters:
+                task_type === 'service.status'
+                  ? { service_id: value.resource_id }
+                  : task_type === 'ssh.audit'
+                    ? { profile_id: value.resource_id }
+                    : {},
+              status: 'PENDING',
+              created_at: now,
+              dispatch_expires_at: now + value.ttl_seconds,
+              execution_timeout_ms: value.execution_timeout_ms,
+              result_due_at: now + value.ttl_seconds + 60,
+              execution_authorized_at: null,
+              result_received_at: null,
+            },
+            result: null,
+          })
+        }
+      const batch = { id: randomId(), profile_id: value.profile_id, created_at: now, taskIds }
+      batches.set(batch.id, batch)
+      return json(batchResponse(batch))
+    }),
+    http.get(`${root}/diagnostics/:id`, ({ request, params }) => {
+      const denied = authorize(request, 'tasks:read')
+      if (denied) return denied
+      advance()
+      const batch = batches.get(String(params.id))
+      return batch ? json(batchResponse(batch)) : problem('not_found', 404)
+    }),
+    http.post(`${root}/tasks/:id/cancel`, ({ request, params }) => {
+      const denied = authorize(request, 'tasks:write', true)
+      if (denied) return denied
+      const entry = state.tasks.find((item) => item.task.id === params.id)
+      if (!entry) return problem('not_found', 404)
+      if (entry.task.status !== 'PENDING') return problem('state_conflict', 409)
+      entry.task.status = 'FAILED'
+      entry.result = {
+        status: 'FAILED',
+        error: 'cancelled_before_dispatch',
+        completed_at: Math.floor(Date.now() / 1000),
+        payload: {},
+        evidence: {
+          coverage: 'unavailable',
+          resources_total: 0,
+          resources_available: 0,
+          truncated: false,
+        },
+      }
+      return json({})
+    }),
+    http.get(
+      `${root}/alert-rules`,
+      ({ request }) => authorize(request, 'audit:read') ?? json(rules),
+    ),
+    http.post(`${root}/alert-rules`, async ({ request }) => {
+      const denied = authorize(request, 'audit:read', true)
+      if (denied) return denied
+      const rule = alertRuleSchema.safeParse(await readBody(request))
+      if (!rule.success) return problem('invalid_request')
+      const at = rules.findIndex((value) => value.id === rule.data.id)
+      if (at < 0) rules.push(rule.data)
+      else rules[at] = rule.data
+      return json({})
+    }),
+    http.get(
+      `${root}/alerts`,
+      ({ request }) => authorize(request, 'audit:read') ?? json({ items: [], next_cursor: '' }),
+    ),
+    http.get(`${root}/alert-events`, ({ request }) => authorize(request, 'audit:read') ?? json([])),
     http.get(`${root}/agents`, ({ request }) => {
       const denied = authorize(request, 'agents:read')
       if (denied) return denied
@@ -266,6 +461,30 @@ export function managementHandlers(
         expires_at: Math.floor(Date.now() / 1000) + parsed.data.ttl_seconds,
       })
     }),
+    http.get(
+      `${root}/agents/:id/capabilities`,
+      ({ request }) => authorize(request, 'agents:read') ?? json(null),
+    ),
+    http.post(`${root}/agents/:id/tags`, async ({ request, params }) => {
+      const denied = authorize(request, 'agents:write', true)
+      if (denied) return denied
+      const body = (await readBody(request)) as { tags: string[] }
+      const agent = state.agents.find((value) => value.node_id === params.id)
+      if (!agent) return problem('not_found', 404)
+      agent.tags = body.tags
+      return json({})
+    }),
+    http.post(`${root}/agents/:id/revoke`, async ({ request, params }) => {
+      const denied = authorize(request, 'agents:write', true)
+      if (denied) return denied
+      const body = (await readBody(request)) as { confirm_node_id: string }
+      const agent = state.agents.find((value) => value.node_id === params.id)
+      if (!agent) return problem('not_found', 404)
+      if (body.confirm_node_id !== agent.node_id) return problem('invalid_request')
+      agent.authorization = 'REVOKED'
+      agent.status = 'disabled'
+      return json({})
+    }),
     http.post(`${root}/agents/:id/rename`, async ({ request, params }) => {
       const denied = authorize(request, 'agents:write', true)
       if (denied) return denied
@@ -308,6 +527,7 @@ export function managementHandlers(
       if (!agent) return problem('not_found', 404)
       if (agent.status === 'active') {
         agent.status = 'disabled'
+        agent.authorization = 'DISABLED'
         for (const entry of state.tasks.filter(
           (entry) =>
             entry.task.node_id === agent.node_id &&
@@ -319,6 +539,12 @@ export function managementHandlers(
           entry.result = {
             status,
             error: 'node_disabled',
+            evidence: {
+              coverage: 'unavailable',
+              resources_total: 0,
+              resources_available: 0,
+              truncated: false,
+            },
             completed_at: entry.task.result_received_at,
             payload: {},
           }

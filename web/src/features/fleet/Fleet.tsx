@@ -10,7 +10,7 @@ import {
   Server,
 } from 'lucide-react'
 import { EmptyState, ErrorState, Loading, Notice, PageHeader } from '../../components/ui'
-import { heartbeat } from '../../lib/format'
+import { observationStatus, statusLabel } from '../../lib/status'
 import { useIdentity } from '../auth/context'
 import { NodeTable } from './NodeTable'
 import { useNow, useSummary } from './useSummary'
@@ -46,7 +46,9 @@ export function FleetPage({ overview = false }: { overview?: boolean }) {
   const data = summary.data
   const counts = data.nodes.reduce(
     (result, node) => {
-      const state = heartbeat(node.last_seen_at, now)
+      const projected = observationStatus(node, now)
+      const state = statusLabel(projected.connectivity)
+      if (projected.telemetry === 'STALE') result.Stale = (result.Stale ?? 0) + 1
       result[state] = (result[state] ?? 0) + 1
       return result
     },
@@ -56,7 +58,7 @@ export function FleetPage({ overview = false }: { overview?: boolean }) {
     (node) =>
       node.traffic.inbound_bps !== null &&
       node.traffic.as_of !== null &&
-      now - node.traffic.as_of <= 90,
+      observationStatus(node, now).telemetry === 'FRESH',
   )
   const inbound = reporting.length
     ? reporting.reduce((total, node) => total + node.traffic.inbound_bps!, 0)
@@ -64,7 +66,10 @@ export function FleetPage({ overview = false }: { overview?: boolean }) {
   const filtered = data.nodes.filter(
     (node) =>
       node.display_name.toLowerCase().includes(search.toLowerCase()) &&
-      (status === 'all' || heartbeat(node.last_seen_at, now) === status),
+      (status === 'all' ||
+        (status === 'Stale'
+          ? observationStatus(node, now).telemetry === 'STALE'
+          : statusLabel(observationStatus(node, now).connectivity) === status)),
   )
   const pageSize = 20
   const pages = Math.max(1, Math.ceil(filtered.length / pageSize))
@@ -248,14 +253,14 @@ export function FleetPage({ overview = false }: { overview?: boolean }) {
                       <span className="mini-dot amber" />
                       Stale
                     </dt>
-                    <dd>90 seconds – 5 minutes</dd>
+                    <dd>Telemetry older than three collection intervals</dd>
                   </div>
                   <div>
                     <dt>
                       <span className="mini-dot gray" />
                       Offline
                     </dt>
-                    <dd>Over 5 minutes</dd>
+                    <dd>Heartbeat older than 90 seconds</dd>
                   </div>
                 </dl>
                 <p>A recent heartbeat confirms contact, not overall health.</p>

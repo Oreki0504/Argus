@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/Oreki0504/Argus-C2/internal/identity"
 	"github.com/Oreki0504/Argus-C2/internal/localfile"
@@ -16,6 +18,7 @@ type User struct {
 	Name        string `json:"name"`
 	Role        string `json:"role"`
 	TokenSHA256 string `json:"token_sha256"`
+	ExpiresAt   int64  `json:"expires_at,omitempty"`
 }
 type Config struct {
 	Users []User `json:"users"`
@@ -31,6 +34,21 @@ func Load(path string) (Config, error) {
 	if e = strictjson.Decode(b, &c, 32768, "users"); e != nil {
 		return c, e
 	}
+	var raw struct {
+		Users []json.RawMessage `json:"users"`
+	}
+	if e = json.Unmarshal(b, &raw); e != nil {
+		return c, e
+	}
+	for _, entry := range raw.Users {
+		var user User
+		fields := []string{"name", "role", "token_sha256"}
+		if e = strictjson.Decode(entry, &user, 1024, fields...); e != nil {
+			if e = strictjson.Decode(entry, &user, 1024, append(fields, "expires_at")...); e != nil {
+				return c, e
+			}
+		}
+	}
 	return c, c.Validate()
 }
 func (c Config) Validate() error {
@@ -39,7 +57,7 @@ func (c Config) Validate() error {
 	}
 	names, hashes := map[string]bool{}, map[string]bool{}
 	for _, u := range c.Users {
-		if !identity.Valid(u.Name) || (u.Role != "Admin" && u.Role != "ReadOnly") || !identity.Hex(u.TokenSHA256, 64) || names[u.Name] || hashes[u.TokenSHA256] {
+		if !identity.Valid(u.Name) || (u.Role != "Admin" && u.Role != "ReadOnly") || !identity.Hex(u.TokenSHA256, 64) || names[u.Name] || hashes[u.TokenSHA256] || u.ExpiresAt < 0 || u.ExpiresAt > 253402300799 {
 			return errors.New("invalid or duplicate administrator")
 		}
 		names[u.Name] = true
@@ -53,7 +71,7 @@ func (c Config) Authenticate(token string) (User, error) {
 	}
 	want := Digest(token)
 	for _, u := range c.Users {
-		if subtle.ConstantTimeCompare([]byte(want), []byte(u.TokenSHA256)) == 1 {
+		if subtle.ConstantTimeCompare([]byte(want), []byte(u.TokenSHA256)) == 1 && (u.ExpiresAt == 0 || time.Now().Unix() < u.ExpiresAt) {
 			return u, nil
 		}
 	}
@@ -61,6 +79,6 @@ func (c Config) Authenticate(token string) (User, error) {
 }
 func NewUser(name, role string) (User, string, error) {
 	token := identity.RandomID() + identity.RandomID()
-	u := User{name, role, Digest(token)}
+	u := User{Name: name, Role: role, TokenSHA256: Digest(token)}
 	return u, token, (Config{Users: []User{u}}).Validate()
 }
